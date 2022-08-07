@@ -1,1 +1,1 @@
-# OOD_Detection
+# our_method
