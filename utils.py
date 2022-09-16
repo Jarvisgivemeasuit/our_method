@@ -82,7 +82,7 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
         # remove `module.` prefix
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         # remove `backbone.` prefix induced by multicrop wrapper
-        # state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
+        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
         print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
     else:
@@ -639,6 +639,7 @@ class MultiCropWrapper(nn.Module):
 def get_params_groups(model):
     regularized = []
     not_regularized = []
+    less_lr = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -647,7 +648,9 @@ def get_params_groups(model):
             not_regularized.append(param)
         else:
             regularized.append(param)
-    return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
+
+    return [{'params': regularized}, 
+            {'params': not_regularized, 'weight_decay': 0.}]
 
 
 def has_batchnorms(model):

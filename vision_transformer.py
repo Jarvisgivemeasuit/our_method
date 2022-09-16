@@ -278,7 +278,9 @@ def vit_onelayer(embed_dim, **kwargs):
 
 
 class DINOHead(nn.Module):
-    def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+    def __init__(self, in_dim, out_dim, use_bn=False, 
+                norm_last_layer=True, nlayers=3, hidden_dim=2048, 
+                bottleneck_dim=25, use_weight=True):
         super().__init__()
         nlayers = max(nlayers, 1)
         if nlayers == 1:
@@ -296,6 +298,9 @@ class DINOHead(nn.Module):
             layers.append(nn.Linear(hidden_dim, bottleneck_dim))
             self.mlp = nn.Sequential(*layers)
         self.apply(self._init_weights)
+        self.use_weight = use_weight
+        if use_weight:
+            self.weight_layer = nn.Linear(bottleneck_dim, 32, bias=False)
         self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
         self.last_layer.weight_g.data.fill_(1)
         if norm_last_layer:
@@ -310,5 +315,8 @@ class DINOHead(nn.Module):
     def forward(self, x):
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
-        x = self.last_layer(x)
-        return x
+        out = self.last_layer(x)
+        if self.use_weight:
+            weight = self.weight_layer(x)
+            return weight, out
+        return out

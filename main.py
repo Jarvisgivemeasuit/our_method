@@ -183,8 +183,8 @@ def train_dino(args):
     #     embed_dim = student.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
+        student = torchvision_models.__dict__[args.arch](num_classes=args.out_dim)
+        teacher = torchvision_models.__dict__[args.arch](num_classes=args.out_dim)
         embed_dim = student.fc.weight.shape[1]
     else:
         print(f"Unknow architecture: {args.arch}")
@@ -242,6 +242,7 @@ def train_dino(args):
         optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
     elif args.optimizer == "lars":
         optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+    center_optim = torch.optim.SGD(center_loss.parameters(), lr=0., momentum=0.9)
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
@@ -285,7 +286,7 @@ def train_dino(args):
 
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+            data_loader, optimizer, center_optim, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
         # ============ writing logs ... ============
@@ -314,7 +315,7 @@ def train_dino(args):
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_loss, data_loader,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
+                    optimizer, center_optim, lr_schedule, wd_schedule, momentum_schedule,epoch,
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
@@ -326,14 +327,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
 
+        # update gmm parameters using a more smaller learning rate
+        for param_group in center_optim.param_groups:
+            param_group['lr'] = lr_schedule[it] * 0.001
+
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            _, teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
+            gmm_weights, student_output = student(images)
             dinoloss = dino_loss(student_output, teacher_output, epoch)
-            centerloss = center_loss(student_output, labels) * 16
+            centerloss = center_loss(gmm_weights, student_output, labels) * 16
             loss = dinoloss + centerloss
 
         if not math.isfinite(loss.item()):
@@ -342,6 +347,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
 
         # student update
         optimizer.zero_grad()
+        center_optim.zero_grad()
         param_norms = None
         if fp16_scaler is None:
             loss.backward()
@@ -350,6 +356,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
+            center_optim.step()
         else:
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
@@ -358,6 +365,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
+            fp16_scaler.step(center_optim)
             fp16_scaler.update()
 
         # EMA update for the teacher
@@ -368,7 +376,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
 
         # logging
         torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
+        metric_logger.update(dinoloss=dinoloss.item())
+        metric_logger.update(centerloss=centerloss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
     # gather the stats from all processes
@@ -527,45 +536,84 @@ class EnhancedCenterLoss(nn.Module):
         num_classes (int): number of classes.
         feat_dim (int): feature dimension.
     """
-    def __init__(self, ncrops, num_classes=64, feat_dim=[32, 256], use_gpu=True, decom=True):
+    def __init__(self, ncrops, num_classes=64, feat_dim=[32, 256], use_gpu=True, decom=True, gamma=0.999):
         super(EnhancedCenterLoss, self).__init__()
         self.num_classes = num_classes
         self.ncrops = ncrops
         self.feat_dim = feat_dim
+        self.gamma = gamma
 
         assert len(feat_dim) == 2
-        if not decom:
-            self.centers_shape = [num_classes, feat_dim[0] * feat_dim[1]]
         self.centers_shape = feat_dim.copy()
         self.centers_shape.insert(0, num_classes)
+        self.covars_shape = self.centers_shape.copy()
+        self.covars_shape.append(feat_dim[1])
+
+        if not decom:
+            self.centers_shape = [num_classes, feat_dim[0] * feat_dim[1]]
+            self.covars_shape = [num_classes, feat_dim[0] * feat_dim[1], feat_dim[0] * feat_dim[1]]
+
         if use_gpu:
             self.centers = nn.Parameter(torch.randn(self.centers_shape).cuda())
+            # self.covars = nn.Parameter(torch.zeros(self.covars_shape).cuda(), requires_grad=False)
+            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]).cuda(), requires_grad=False)
         else:
             self.centers = nn.Parameter(torch.randn(self.centers_shape))
+            # self.covars = nn.Parameter(torch.zeros(self.covars_shape), requires_grad=False)
+            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]), requires_grad=False)
 
-    def forward(self, x, labels):
+    def forward(self, gmm_weights, x, labels):
         """
         Args:
             x: feature matrix with shape (batch_size, feat_dim).
             labels: ground truth labels with shape (num_classes).
         """
-
+        x = x.reshape(-1, self.feat_dim[0], self.feat_dim[1])
         x = x.chunk(self.ncrops)
+
+        gmm_weights = gmm_weights.reshape(-1, self.feat_dim[0])
+        gmm_weights = gmm_weights.chunk(self.ncrops)
+
         assert x[0].size(0) == labels.size(0), "features.size(0) is not equal to labels.size(0)"
         total_loss = 0
         for i in range(2):
-            inp = x[i].unsqueeze(1).expand(-1, self.num_classes, -1)
-            inp = inp.reshape(-1, self.num_classes, self.feat_dim[0], self.feat_dim[1])
-            tar = self.centers.unsqueeze(0).expand(labels.shape[0], -1, -1, -1)
 
-            kl = F.kl_div(F.log_softmax(inp,dim=-1), F.softmax(tar, dim=-1),reduction='none').mean(-1)
             # Ensure that the input has a negative scatter with other centers
-            symb = torch.ones_like(kl) * -1
-            symb[range(len(labels)), labels] *= -1
-            kl = torch.clamp(kl, min=1e-5, max=1e+5) * symb
+            # symb = torch.ones_like(kl) * -1
+            # symb[range(len(labels)), labels] *= -1
+            # kl = torch.clamp(kl, min=1e-5, max=1e+5) * symb
+            # loss = kl.mean()
 
-            loss = kl.mean()
+            center = self.centers[labels]
+            # kl_x = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center.clone().detach(), dim=-1), reduction='none').sum(-1)
+            # kl_ce = F.kl_div(F.log_softmax(center, dim=-1), F.softmax(x[i].clone().detach(),dim=-1), reduction='none').sum(-1)
+
+            # kl = ((kl_ce+kl_x) * F.softmax(gmm_weights[i], dim=-1)).sum(-1)
+
+            kl = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center, dim=-1), reduction='none').sum(-1)
+            kl = (kl * F.softmax(gmm_weights[i], dim=-1)).sum(-1)
+            loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
             total_loss += loss
+
+            gmm_weight = self.gmm_weights[labels]
+            kl = F.kl_div(F.log_softmax(gmm_weight, dim=-1), F.softmax(gmm_weights),reduction='batchmean')
+            loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
+            total_loss += loss
+            # co = (x[i].detach() - center).reshape(-1, self.feat_dim[1], 1)
+            # co = torch.bmm(co, co.permute(0, 2, 1))
+            # co = co.reshape(-1, self.feat_dim[0], self.feat_dim[1], self.feat_dim[1])
+            # co = co * gmm_weights[i].reshape(-1, self.feat_dim[0], 1, 1)
+
+            # for cls in labels.unique():
+                # batch_mean = x[i][cls].mean(0)
+                # self.centers[cls] = self.centers * self.gamma + batch_mean * (1 - self.gamma)
+
+                # self.gmm_weights[cls] = gmm_weights[i][labels==cls].detach().mean(0) * (1 - self.gamma) + \
+                #                         self.gmm_weights[cls] * self.gamma
+
+                # c = co[labels==cls].mean(0)
+                # self.covars[cls] = self.covars[cls] * self.gamma + c * (1 - self.gamma)
+
         return total_loss / 2
 
 

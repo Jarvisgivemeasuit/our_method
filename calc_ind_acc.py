@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 from torchvision import models as torchvision_models
+from torchvision import transforms
 
 import utils
 from dataset.imagenet import Imagenet
@@ -17,8 +18,13 @@ from progress.bar import Bar
 
 def calculate_ind_acc(args):
     utils.init_distributed_mode(args)
-
-    dataset_train = Imagenet('train', 100)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        # transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    dataset_train = get_dataset('val', 'onlyin', args.data_path, 0, transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     dataloader = torch.utils.data.DataLoader(
         dataset_train,
@@ -53,8 +59,8 @@ def calculate_ind_acc(args):
     model.cuda()
     model.eval()
     # load weights to evaluate
-    centers = utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size).cuda()
-    centers = centers.unsqueeze(0).expand(args.batch_size_per_gpu, centers.shape[0], centers.shape[-1]).reshape(-1, centers.shape[-1])
+    centers, gmm_weights = load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
+    clses, kers, dims = centers.shape
     acc = Accuracy()
 
     num_batch = len(dataloader)
@@ -63,10 +69,14 @@ def calculate_ind_acc(args):
     for idx, (x, cls, _) in enumerate(dataloader):
         x, cls = x.cuda(), cls.cuda()
         with torch.no_grad():
-            q = model(x)
-        
-        q = q.unsqueeze(1).expand(q.shape[0], 100, q.shape[-1]).reshape(-1, q.shape[-1])
-        results =torch.cosine_similarity(q, centers, dim=1).reshape(-1, 100)
+            _, q = model(x)
+        bs = q.shape[0]
+
+        centers_ = centers.unsqueeze(0).expand(bs, clses, kers, dims).reshape(-1, dims).cuda()
+        q = q.unsqueeze(1).expand(bs, clses, kers * dims).reshape(-1, dims)
+
+        results = torch.cosine_similarity(q, centers_, dim=1).reshape(-1, clses, kers)
+        results = (results * gmm_weights.cuda()).sum(-1)
         # results = torch.pairwise_distance(q, centers).reshape(-1, 100)
         results = torch.argmax(results, 1)
         # print(results, cls)
@@ -95,6 +105,35 @@ class Accuracy:
     def reset(self):
         self.num_correct = 0
         self.num_instance = 0
+
+
+def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
+    if os.path.isfile(pretrained_weights):
+        state_dict = torch.load(pretrained_weights, map_location="cpu")
+
+        if 'center_loss' in state_dict.keys():
+            centers = state_dict['center_loss']['centers']
+            gmm_weights = state_dict['center_loss']['gmm_weights']
+
+        if checkpoint_key is not None and checkpoint_key in state_dict:
+            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            state_dict = state_dict[checkpoint_key]
+        # remove `module.` prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        # remove `backbone.` prefix induced by multicrop wrapper
+        # state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
+        msg = model.load_state_dict(state_dict, strict=False)
+        print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
+        return centers, gmm_weights
+
+
+def get_dataset(mode, domain, data_path, k, transform):
+    if 'ImageNet' in data_path:
+        return Imagenet(mode, domain, data_path, k, transform)
+    elif 'ifood' in data_path:
+        return IFOOD(mode, domain, data_path, k, transform)
+    else:
+        return INATURALIST(mode, domain, data_path, k, transform)
 
 
 if __name__ == '__main__':
