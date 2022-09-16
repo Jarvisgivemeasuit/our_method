@@ -329,7 +329,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
 
         # update gmm parameters using a more smaller learning rate
         for param_group in center_optim.param_groups:
-            param_group['lr'] = lr_schedule[it] * 0.001
+            param_group['lr'] = lr_schedule[it] * 0.0001
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -555,12 +555,12 @@ class EnhancedCenterLoss(nn.Module):
 
         if use_gpu:
             self.centers = nn.Parameter(torch.randn(self.centers_shape).cuda())
-            # self.covars = nn.Parameter(torch.zeros(self.covars_shape).cuda(), requires_grad=False)
-            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]).cuda(), requires_grad=False)
+            self.covars = nn.Parameter(torch.randn(self.covars_shape).cuda())
+            self.gmm_weights = nn.Parameter(torch.randn(num_classes, feat_dim[0]).cuda())
         else:
             self.centers = nn.Parameter(torch.randn(self.centers_shape))
-            # self.covars = nn.Parameter(torch.zeros(self.covars_shape), requires_grad=False)
-            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]), requires_grad=False)
+            self.covars = nn.Parameter(torch.randn(self.covars_shape))
+            self.gmm_weights = nn.Parameter(torch.randn(num_classes, feat_dim[0]))
 
     def forward(self, gmm_weights, x, labels):
         """
@@ -578,12 +578,6 @@ class EnhancedCenterLoss(nn.Module):
         total_loss = 0
         for i in range(2):
 
-            # Ensure that the input has a negative scatter with other centers
-            # symb = torch.ones_like(kl) * -1
-            # symb[range(len(labels)), labels] *= -1
-            # kl = torch.clamp(kl, min=1e-5, max=1e+5) * symb
-            # loss = kl.mean()
-
             center = self.centers[labels]
             # kl_x = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center.clone().detach(), dim=-1), reduction='none').sum(-1)
             # kl_ce = F.kl_div(F.log_softmax(center, dim=-1), F.softmax(x[i].clone().detach(),dim=-1), reduction='none').sum(-1)
@@ -596,20 +590,24 @@ class EnhancedCenterLoss(nn.Module):
             total_loss += loss
 
             gmm_weight = self.gmm_weights[labels]
-            kl = F.kl_div(F.log_softmax(gmm_weight, dim=-1), F.softmax(gmm_weights),reduction='batchmean')
+            kl = F.kl_div(F.log_softmax(gmm_weight, dim=-1), F.softmax(gmm_weights[i].clone().detach(), dim=-1),reduction='batchmean')
             loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
             total_loss += loss
-            # co = (x[i].detach() - center).reshape(-1, self.feat_dim[1], 1)
-            # co = torch.bmm(co, co.permute(0, 2, 1))
-            # co = co.reshape(-1, self.feat_dim[0], self.feat_dim[1], self.feat_dim[1])
-            # co = co * gmm_weights[i].reshape(-1, self.feat_dim[0], 1, 1)
+
+            co = (x[i].detach() - center).reshape(-1, self.feat_dim[1], 1)
+            co = torch.bmm(co, co.permute(0, 2, 1))
+            co = co.reshape(-1, self.feat_dim[0], self.feat_dim[1], self.feat_dim[1])
+            co = co * gmm_weights[i].reshape(-1, self.feat_dim[0], 1, 1)
+
+            sigma = self.covars[labels]
+            kl = F.kl_div(F.log_softmax(sigma, dim=-1), F.softmax(co.clone().detach(), dim=-1),reduction='batchmean')
 
             # for cls in labels.unique():
-                # batch_mean = x[i][cls].mean(0)
-                # self.centers[cls] = self.centers * self.gamma + batch_mean * (1 - self.gamma)
-
                 # self.gmm_weights[cls] = gmm_weights[i][labels==cls].detach().mean(0) * (1 - self.gamma) + \
                 #                         self.gmm_weights[cls] * self.gamma
+
+                # batch_mean = x[i][cls].mean(0)
+                # self.centers[cls] = self.centers * self.gamma + batch_mean * (1 - self.gamma)
 
                 # c = co[labels==cls].mean(0)
                 # self.covars[cls] = self.covars[cls] * self.gamma + c * (1 - self.gamma)

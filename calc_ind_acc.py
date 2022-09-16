@@ -7,6 +7,7 @@ import numpy as np
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torchvision import models as torchvision_models
 from torchvision import transforms
 
