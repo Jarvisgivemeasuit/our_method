@@ -20,13 +20,9 @@ import vision_transformer as vits
 from progress.bar import Bar
 
 
-def get_dataset(mode, domain, data_path, k, transform):
+def get_dataset(mode, data_path, k, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, domain, data_path, k, transform)
-    elif 'ifood' in data_path:
-        return IFOOD(mode, domain, data_path, k, transform)
-    else:
-        return INATURALIST(mode, domain, data_path, k, transform)
+        return Imagenet(mode, data_path, k, transform)
 
         
 def calculate_var(args, gamma=0.9):
@@ -90,7 +86,7 @@ def calculate_var(args, gamma=0.9):
     num_batch = len(dataloader)
     bar = Bar('Calculating variance:', max=num_batch)
 
-    for idx, (x, cls, _) in enumerate(dataloader):
+    for idx, (x, cls) in enumerate(dataloader):
         x, cls = x.cuda(), cls.cuda()
         with torch.no_grad():
             if 'center' in args.pretrained_weights:

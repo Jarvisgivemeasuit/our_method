@@ -151,8 +151,7 @@ def train_dino(args):
         args.local_crops_number,
     )
     # dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    dataset = get_dataset('train', 'onlyin', args.data_path, args.k, transform)
-    # dataset = IFOOD('train', 'onlyin', args.data_path, transform)
+    dataset = get_dataset('train', args.data_path, args.k, transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -161,6 +160,7 @@ def train_dino(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True
     )
     print(f"Data loaded: there are {len(dataset)} images.")
 
@@ -319,7 +319,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, labels, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, labels) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -328,8 +328,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
                 param_group["weight_decay"] = wd_schedule[it]
 
         # update gmm parameters using a more smaller learning rate
+        gmm_lr = lr_schedule[it] * 1e-5
         for param_group in center_optim.param_groups:
-            param_group['lr'] = lr_schedule[it] * 0.0001
+            param_group['lr'] = gmm_lr
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -338,7 +339,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             _, teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             gmm_weights, student_output = student(images)
             dinoloss = dino_loss(student_output, teacher_output, epoch)
-            centerloss = center_loss(gmm_weights, student_output, labels) * 16
+            centerloss = center_loss(gmm_weights, student_output, labels, 1e-5, epoch) * 16
             loss = dinoloss + centerloss
 
         if not math.isfinite(loss.item()):
@@ -349,6 +350,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
         optimizer.zero_grad()
         center_optim.zero_grad()
         param_norms = None
+
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
@@ -359,6 +361,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             center_optim.step()
         else:
             fp16_scaler.scale(loss).backward()
+
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
@@ -367,6 +370,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             fp16_scaler.step(optimizer)
             fp16_scaler.step(center_optim)
             fp16_scaler.update()
+
 
         # EMA update for the teacher
         with torch.no_grad():
@@ -536,12 +540,11 @@ class EnhancedCenterLoss(nn.Module):
         num_classes (int): number of classes.
         feat_dim (int): feature dimension.
     """
-    def __init__(self, ncrops, num_classes=64, feat_dim=[32, 256], use_gpu=True, decom=True, gamma=0.999):
+    def __init__(self, ncrops, num_classes=64, feat_dim=[32, 256], use_gpu=True, decom=True):
         super(EnhancedCenterLoss, self).__init__()
         self.num_classes = num_classes
         self.ncrops = ncrops
         self.feat_dim = feat_dim
-        self.gamma = gamma
 
         assert len(feat_dim) == 2
         self.centers_shape = feat_dim.copy()
@@ -555,14 +558,12 @@ class EnhancedCenterLoss(nn.Module):
 
         if use_gpu:
             self.centers = nn.Parameter(torch.randn(self.centers_shape).cuda())
-            self.covars = nn.Parameter(torch.randn(self.covars_shape).cuda())
-            self.gmm_weights = nn.Parameter(torch.randn(num_classes, feat_dim[0]).cuda())
+            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]).cuda(), requires_grad=False)
         else:
             self.centers = nn.Parameter(torch.randn(self.centers_shape))
-            self.covars = nn.Parameter(torch.randn(self.covars_shape))
-            self.gmm_weights = nn.Parameter(torch.randn(num_classes, feat_dim[0]))
+            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]), requires_grad=False)
 
-    def forward(self, gmm_weights, x, labels):
+    def forward(self, gmm_weights, x, labels, gamma, epoch):
         """
         Args:
             x: feature matrix with shape (batch_size, feat_dim).
@@ -579,49 +580,60 @@ class EnhancedCenterLoss(nn.Module):
         for i in range(2):
 
             center = self.centers[labels]
-            # kl_x = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center.clone().detach(), dim=-1), reduction='none').sum(-1)
-            # kl_ce = F.kl_div(F.log_softmax(center, dim=-1), F.softmax(x[i].clone().detach(),dim=-1), reduction='none').sum(-1)
 
-            # kl = ((kl_ce+kl_x) * F.softmax(gmm_weights[i], dim=-1)).sum(-1)
+            '''loss for center'''
+            kl_x = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center.clone().detach(), dim=-1), reduction='none').sum(-1)
+            kl_ce = F.kl_div(F.log_softmax(center, dim=-1), F.softmax(x[i].clone().detach(),dim=-1), reduction='none').sum(-1)
 
-            kl = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center, dim=-1), reduction='none').sum(-1)
-            kl = (kl * F.softmax(gmm_weights[i], dim=-1)).sum(-1)
-            loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
+            '''loss for gmm weights'''
+            loss = (kl_x.clone().detach() * F.softmax(gmm_weights[i], dim=-1)).mean()
             total_loss += loss
 
-            gmm_weight = self.gmm_weights[labels]
-            kl = F.kl_div(F.log_softmax(gmm_weight, dim=-1), F.softmax(gmm_weights[i].clone().detach(), dim=-1),reduction='batchmean')
-            loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
+            if epoch > 15:
+                kl = (kl_ce + kl_x)
+            else:
+                kl = kl_ce
+            loss = torch.clamp(kl, min=1e-5, max=1e+5).mean()
             total_loss += loss
 
-            co = (x[i].detach() - center).reshape(-1, self.feat_dim[1], 1)
-            co = torch.bmm(co, co.permute(0, 2, 1))
-            co = co.reshape(-1, self.feat_dim[0], self.feat_dim[1], self.feat_dim[1])
-            co = co * gmm_weights[i].reshape(-1, self.feat_dim[0], 1, 1)
+            # kl = F.kl_div(F.log_softmax(x[i],dim=-1), F.softmax(center, dim=-1), reduction='none').sum(-1)
+            # kl = (kl * F.softmax(gmm_weights[i], dim=-1)).sum(-1)
+            # loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
+            # total_loss += loss
+            
+            # np.set_printoptions(suppress=True)
+            # np.set_printoptions(threshold=np.inf)
+            # print(F.softmax(gmm_weights[i], dim=-1).detach().cpu().numpy())
 
-            sigma = self.covars[labels]
-            kl = F.kl_div(F.log_softmax(sigma, dim=-1), F.softmax(co.clone().detach(), dim=-1),reduction='batchmean')
+            # gmm_weight = self.gmm_weights[labels]
+            # kl = F.kl_div(F.log_softmax(gmm_weight, dim=-1), F.softmax(gmm_weights[i].clone().detach(), dim=-1),reduction='batchmean')
+            # loss = torch.clamp(kl, min=1e-5, max=1e+5).mean(dim=-1)
+            # total_loss += loss
 
-            # for cls in labels.unique():
-                # self.gmm_weights[cls] = gmm_weights[i][labels==cls].detach().mean(0) * (1 - self.gamma) + \
-                #                         self.gmm_weights[cls] * self.gamma
+            # co = (x[i].detach() - center.detach()).reshape(-1, self.feat_dim[1], 1)
+            # co = torch.bmm(co, co.permute(0, 2, 1))
+            # co = co.reshape(-1, self.feat_dim[0], self.feat_dim[1], self.feat_dim[1])
+            # co = co * gmm_weights[i].reshape(-1, self.feat_dim[0], 1, 1)
 
-                # batch_mean = x[i][cls].mean(0)
-                # self.centers[cls] = self.centers * self.gamma + batch_mean * (1 - self.gamma)
+            # sigma = self.covars[labels]
+            # kl = F.kl_div(F.log_softmax(sigma, dim=-1), F.softmax(co.clone().detach(), dim=-1),reduction='batchmean')
 
-                # c = co[labels==cls].mean(0)
-                # self.covars[cls] = self.covars[cls] * self.gamma + c * (1 - self.gamma)
+            for cls in labels.unique():
+                self.gmm_weights[cls] = F.softmax(gmm_weights[i][labels==cls], dim=-1).detach().mean(0) * gamma + \
+                                        self.gmm_weights[cls] * (1 - gamma)
+
+                # batch_mean = x[i][labels==cls].mean(0).clone().detach()
+                # self.centers[cls] = self.centers[cls] * gamma + batch_mean * (1 - gamma)
+
+                # c = co[labels==cls].mean(0).cpu()
+                # self.covars[cls] = self.covars[cls].cpu() * (1 - gamma) + c * gamma
 
         return total_loss / 2
 
 
-def get_dataset(mode, domain, data_path, k, transform):
+def get_dataset(mode, data_path, k, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, domain, data_path, k, transform)
-    elif 'ifood' in data_path:
-        return IFOOD(mode, domain, data_path, k, transform)
-    else:
-        return INATURALIST(mode, domain, data_path, k, transform)
+        return Imagenet(mode, data_path, k, transform)
 
 
 if __name__ == '__main__':

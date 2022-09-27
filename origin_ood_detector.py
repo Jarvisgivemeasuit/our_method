@@ -27,7 +27,7 @@ from torchvision import transforms
 from torchvision import models as torchvision_models
 
 import utils
-from dataset.imagenet import Imagenet
+from dataset.imagenet_split import Imagenet
 from dataset.ifood import IFOOD
 from dataset.inat import INATURALIST
 

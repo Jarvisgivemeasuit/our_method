@@ -25,7 +25,7 @@ def calculate_ind_acc(args):
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = get_dataset('val', 'onlyin', args.data_path, 0, transform)
+    dataset_train = get_dataset('val', args.data_path, 0, transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     dataloader = torch.utils.data.DataLoader(
         dataset_train,
@@ -67,7 +67,7 @@ def calculate_ind_acc(args):
     num_batch = len(dataloader)
     bar = Bar('Calculating ind_acc:', max=num_batch)
 
-    for idx, (x, cls, _) in enumerate(dataloader):
+    for idx, (x, cls) in enumerate(dataloader):
         x, cls = x.cuda(), cls.cuda()
         with torch.no_grad():
             _, q = model(x)
@@ -76,16 +76,27 @@ def calculate_ind_acc(args):
         centers_ = centers.unsqueeze(0).expand(bs, clses, kers, dims).reshape(-1, dims).cuda()
         q = q.unsqueeze(1).expand(bs, clses, kers * dims).reshape(-1, dims)
 
+        # results = F.kl_div(q, centers_, reduction='none').sum(-1).reshape(-1, clses, kers)
+        # results = (results * gmm_weights.cuda()).sum(-1)
+        # results = torch.argmin(results, 1)
+
+        # results = torch.cosine_similarity(q, centers_, dim=1).reshape(clses, -1, kers)
+        # flag = (gmm_weights != 0).sum(0) == 100
+        # results = (results[:, :, flag] * gmm_weights[:, flag].cuda()).sum(-1)
+        # results = torch.argmax(results, 0)
         results = torch.cosine_similarity(q, centers_, dim=1).reshape(-1, clses, kers)
-        results = (results * gmm_weights.cuda()).sum(-1)
-        # results = torch.pairwise_distance(q, centers).reshape(-1, 100)
+        # # results = (results * gmm_weights.cuda()).sum(-1)
+        flag = (gmm_weights != 0).sum(0) == 100
+        results = (results[:, :, flag] * gmm_weights[:, flag].cuda()).sum(-1)
         results = torch.argmax(results, 1)
-        # print(results, cls)
 
         acc.update(results, cls)
-        bar.suffix = f'{idx+1}/{num_batch}, acc:{acc.get_top1()}'
+        bar.suffix = f'{idx+1}/{num_batch}, acc:{(acc.get_top1()*100):.3f}'
         bar.next()
     bar.finish()
+    # np.set_printoptions(suppress=True)
+    # np.set_printoptions(threshold=np.inf)
+    # print(gmm_weights.numpy())
 
         
 class Accuracy:
@@ -128,13 +139,9 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
         return centers, gmm_weights
 
 
-def get_dataset(mode, domain, data_path, k, transform):
+def get_dataset(mode, data_path, k, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, domain, data_path, k, transform)
-    elif 'ifood' in data_path:
-        return IFOOD(mode, domain, data_path, k, transform)
-    else:
-        return INATURALIST(mode, domain, data_path, k, transform)
+        return Imagenet(mode, data_path, k, transform)
 
 
 if __name__ == '__main__':

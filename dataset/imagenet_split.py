@@ -15,7 +15,7 @@ class Imagenet(Dataset):
         mode: Specifies the dataset to train or test.
         data_domain: Determines this dataset as IND or OOD.
     '''
-    def __init__(self, mode, data_path, k, transform=None) -> None:
+    def __init__(self, mode, domain, data_path, k, transform=None) -> None:
         super().__init__()
         assert mode in ['train', 'val']
 
@@ -24,21 +24,51 @@ class Imagenet(Dataset):
         self.imagenet_path = os.path.join(data_path, mode)
         self.classes, self.img_list = {}, []
 
-        with open(f'/home/ljl/Documents/our_method/dataset/ind_imagenet_{k}.txt', 'r') as f:
-            for idx, line in enumerate(f):
-                cls_name = line.strip()
-                self.classes[cls_name] = idx
+        if domain == 'onlyin':
+            with open(f'dataset/ind_imagenet_{k}.txt', 'r') as f:
+                for idx, line in enumerate(f):
+                    cls_name = line.strip()
+                    self.classes[cls_name] = [idx, 0]
 
-                cls_img_list = os.listdir(os.path.join(self.imagenet_path, cls_name))
-                cls_img_list = [os.path.join(cls_name, k) for k in cls_img_list]
-                self.img_list = self.img_list + cls_img_list
+                    cls_img_list = os.listdir(os.path.join(self.imagenet_path, cls_name))
+                    cls_img_list = [os.path.join(cls_name, k) for k in cls_img_list]
+                    self.img_list = self.img_list + cls_img_list
+
+        elif domain == 'onlyout':
+            with open(f'dataset/ood_{self.mode}_imagenet_{k}.txt', 'r') as f:
+                for idx, line in enumerate(f):
+                    cls_name = line.strip()
+                    self.classes[cls_name] = [idx, 1]
+
+                    cls_img_list = os.listdir(os.path.join(self.imagenet_path, cls_name))
+                    cls_img_list = [os.path.join(cls_name, k) for k in cls_img_list]
+                    self.img_list = self.img_list + cls_img_list
+
+        elif domain == 'both':
+            with open(f'dataset/ind_imagenet_{k}.txt', 'r') as f:
+                for idx, line in enumerate(f):
+                    cls_name = line.strip()
+                    self.classes[cls_name] = [idx, 0]
+
+                    cls_img_list = os.listdir(os.path.join(self.imagenet_path, cls_name))
+                    cls_img_list = [os.path.join(cls_name, k) for k in cls_img_list]
+                    self.img_list = self.img_list + cls_img_list
+
+            with open(f'dataset/ood_{self.mode}_imagenet_{k}.txt', 'r') as f:
+                for idx, line in enumerate(f):
+                    cls_name = line.strip()
+                    self.classes[cls_name] = [idx, 1]
+
+                    cls_img_list = os.listdir(os.path.join(self.imagenet_path, cls_name))
+                    cls_img_list = [os.path.join(cls_name, k) for k in cls_img_list]
+                    self.img_list = self.img_list + cls_img_list
 
     def __getitem__(self, idx):
 
         img_name = self.img_list[idx]
 
         cls_name = img_name.split('/')[0]
-        cls_label = self.classes[cls_name]
+        cls_label, domain_label = self.classes[cls_name]
 
         img = Image.open(os.path.join(self.imagenet_path, img_name)).convert('RGB')
         if self.transform:
@@ -47,7 +77,7 @@ class Imagenet(Dataset):
             img = self.train_transforms(img) if self.mode == 'train' else \
                 self.val_transforms(img)
 
-        return img, cls_label
+        return img, cls_label, domain_label
 
     def __len__(self):
         return len(self.img_list)

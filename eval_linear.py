@@ -72,7 +72,7 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = get_dataset('val', 'onlyin', args.data_path, args.k, val_transform)
+    dataset_val = get_dataset('val', args.data_path, args.k, val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -160,7 +160,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    for (inp, target, _) in metric_logger.log_every(loader, 20, header):
+    for (inp, target) in metric_logger.log_every(loader, 20, header):
         # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
@@ -202,7 +202,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
-    for (inp, target, _) in metric_logger.log_every(val_loader, 20, header):
+    for (inp, target) in metric_logger.log_every(val_loader, 20, header):
         # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
@@ -256,13 +256,9 @@ class LinearClassifier(nn.Module):
         return self.linear(x)
 
 
-def get_dataset(mode, domain, data_path, k, transform):
+def get_dataset(mode, data_path, k, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, domain, data_path, k, transform)
-    elif 'ifood' in data_path:
-        return IFOOD(mode, domain, data_path, k, transform)
-    else:
-        return INATURALIST(mode, domain, data_path, k, transform)
+        return Imagenet(mode, data_path, k, transform)
 
 
 if __name__ == '__main__':

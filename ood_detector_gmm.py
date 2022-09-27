@@ -53,7 +53,7 @@ def ood_detector(args):
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = get_dataset('train', 'onlyin', args.data_path, args.k, train_transform)
+    dataset_train = get_dataset('train', args.data_path, args.k, train_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train, shuffle=True)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -70,16 +70,16 @@ def ood_detector(args):
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = get_dataset('val', 'onlyin', args.data_path, 0, val_transform)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset_val)
-    val_loader = torch.utils.data.DataLoader(
-        dataset_val,
+    val_in = get_dataset('val', 'onlyin', args.data_path, 0, val_transform)
+    sampler = torch.utils.data.distributed.DistributedSampler(val_in)
+    val_in_loader = torch.utils.data.DataLoader(
+        val_in,
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    print(f"Data loaded with {len(dataset_train)} train imgs and {len(dataset_val)} val imgs.")
+    print(f"Data loaded with {len(dataset_train)} train imgs and {len(val_in)} val imgs.")
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
@@ -238,12 +238,9 @@ def train(model, classifier, optimizer, loader, epoch, n, avgpool, mu, det_sigma
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, classifier, n, avgpool, mu, det_sigma, sigma_inv, gmm_weights, auroc, fpr95, acc):
+def validate_network(val_loader, model, classifier, n, avgpool, mu, det_sigma, sigma_inv, gmm_weights):
     classifier.eval()
-    num_iter = len(val_loader)
-    bar = Bar('Validating:', max=num_iter)
     results, targets = [], []
-    acc.reset()
 
     for idx, (inp, _, target) in enumerate(val_loader):
         
@@ -257,7 +254,8 @@ def validate_network(val_loader, model, classifier, n, avgpool, mu, det_sigma, s
                 intermediate_output = model.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output = torch.cat((output.unsqueeze(-1), 
+                                torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
                     output = output.reshape(output.shape[0], -1)
             else:
                 _, output = model(inp)
@@ -269,7 +267,6 @@ def validate_network(val_loader, model, classifier, n, avgpool, mu, det_sigma, s
         loss = F.binary_cross_entropy_with_logits(output, target.float())
 
         output, labels = output.cpu(), labels.cpu()
-        acc.update(torch.sigmoid(output) >= 0.5, labels)
 
         output = torch.sigmoid(output).data.numpy()
         labels = labels.numpy()
@@ -278,18 +275,6 @@ def validate_network(val_loader, model, classifier, n, avgpool, mu, det_sigma, s
 
         auroc = calc_auroc(output, labels)
         fpr95 = calc_fpr(output, labels)
-        bar.suffix = '({batch}/{size}) | Total:{total:} | ETA:{eta:} | Loss:{loss:.4f} | Acc:{acc:.4f} | AUROC:{auroc:.4f} | FPR95:{fpr:.4f}'.format(
-            batch=idx + 1,
-            size=num_iter,
-            total=bar.elapsed_td,
-            eta=bar.eta_td,
-            loss=loss,
-            acc=acc.get_top1(),
-            auroc=auroc,
-            fpr=fpr95,
-            )
-        bar.next()
-    bar.finish()
 
     auroc = calc_auroc(results, targets)
     fpr95 = calc_fpr(results, targets)
@@ -373,23 +358,9 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
     return centers, gmm_weights
 
 
-def get_dataset(mode, domain, data_path, k, transform):
+def get_dataset(mode, data_path, k, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, domain, data_path, k, transform)
-    elif 'ifood' in data_path:
-        return IFOOD(mode, domain, data_path, k, transform)
-    elif 'inat' in data_path:
-        return INATURALIST(mode, domain, data_path, k, transform)
-    elif 'cifar10' in data_path and mode == 'train':
-        return datasets.CIFAR10(data_path, train=True, transform=transform)
-    elif 'cifar10' in data_path:
-        return datasets.CIFAR10(data_path, train=False, transform=transform)
-    elif 'cifar100' in data_path and mode == 'train':
-        return datasets.CIFAR100(data_path, train=True, transform=transform)
-    elif 'cifar100' in data_path:
-        return datasets.CIFAR100(data_path, train=False, transform=transform)
-    elif 'tiny-imagenet-200' in data_path:
-        return datasets.ImageFolder(os.path.join(data_path, mode), transform=transform)
+        return Imagenet(mode, data_path, k, transform)   
 
 
 class Classifier(nn.Module):
@@ -403,8 +374,6 @@ class Classifier(nn.Module):
         nn.Linear(embed_dim, embed_dim * 3),
         nn.LeakyReLU(),
         nn.Linear(embed_dim * 3, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, embed_dim),
         nn.LeakyReLU(),
         nn.Linear(embed_dim, num_labels))
 
