@@ -95,6 +95,8 @@ def get_args_parser():
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
+    parser.add_argument('--center_stop_epochs', default=80, type=int, help='''Number of epochs of last training
+        procedure without center updating.''')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
@@ -339,7 +341,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             _, teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             gmm_weights, student_output = student(images)
             dinoloss = dino_loss(student_output, teacher_output, epoch)
-            centerloss = center_loss(gmm_weights, student_output, labels, 1e-5, epoch) * 16
+            centerloss = center_loss(gmm_weights, student_output, labels, 1e-5, epoch, args) * 16
             loss = dinoloss + centerloss
 
         if not math.isfinite(loss.item()):
@@ -358,7 +360,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
-            center_optim.step()
+            if epoch < args.epochs - args.center_stop_epochs:
+                center_optim.step()
         else:
             fp16_scaler.scale(loss).backward()
 
@@ -368,7 +371,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
-            fp16_scaler.step(center_optim)
+            if epoch < args.epochs - args.center_stop_epochs:
+                fp16_scaler.step(center_optim)
             fp16_scaler.update()
 
 
@@ -563,7 +567,7 @@ class EnhancedCenterLoss(nn.Module):
             self.centers = nn.Parameter(torch.randn(self.centers_shape))
             self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]), requires_grad=False)
 
-    def forward(self, gmm_weights, x, labels, gamma, epoch):
+    def forward(self, gmm_weights, x, labels, gamma, epoch, args):
         """
         Args:
             x: feature matrix with shape (batch_size, feat_dim).
@@ -589,10 +593,13 @@ class EnhancedCenterLoss(nn.Module):
             loss = (kl_x.clone().detach() * F.softmax(gmm_weights[i], dim=-1)).mean()
             total_loss += loss
 
-            if epoch > 15:
+            if epoch > 15 and epoch < args.epochs - args.center_stop_epochs:
                 kl = (kl_ce + kl_x)
+            elif epoch > args.epochs - args.center_stop_epochs:
+                kl = kl_x
             else:
                 kl = kl_ce
+
             loss = torch.clamp(kl, min=1e-5, max=1e+5).mean()
             total_loss += loss
 
