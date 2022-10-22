@@ -11,32 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import argparse
 import json
-from pathlib import Path
-import numpy as np
 import math
+import os
+import sys
+from pathlib import Path
 
+import numpy as np
 import torch
-from torch import nn
-import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+from progress.bar import Bar
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+from torch import nn
 from torch.nn import functional as F
 from torchvision import datasets
-from torchvision import transforms
 from torchvision import models as torchvision_models
+from torchvision import transforms
 
 import utils
-from dataset.imagenet_split import Imagenet
+import vision_transformer as vits
 from dataset.ifood import IFOOD
+from dataset.imagenet_split import Imagenet
 from dataset.inat import INATURALIST
 from dataset.tinyimagenet import TinyImages
-
-import vision_transformer as vits
-from progress.bar import Bar
-from sklearn.metrics import accuracy_score, roc_curve, roc_auc_score
 
 
 def ood_detector(args):

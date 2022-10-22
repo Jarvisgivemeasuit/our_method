@@ -1,31 +1,32 @@
-import os
-import sys
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
-import numpy as np
 
+import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
+from progress.bar import Bar
+from torch import nn
 from torchvision import models as torchvision_models
 from torchvision import transforms
 
 import utils
-from dataset.imagenet import Imagenet
 import vision_transformer as vits
-from progress.bar import Bar
+from dataset.imagenet import Imagenet
 
 
 def calculate_ind_acc(args):
     utils.init_distributed_mode(args)
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        # transforms.CenterCrop(224),
+        # transforms.Resize((224, 224)),
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = get_dataset('val', args.data_path, 0, transform)
+    dataset_train = get_dataset('val', args.data_path, args.num_labels, transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     dataloader = torch.utils.data.DataLoader(
         dataset_train,
@@ -73,21 +74,21 @@ def calculate_ind_acc(args):
             _, q = model(x)
         bs = q.shape[0]
 
-        centers_ = centers.unsqueeze(0).expand(bs, clses, kers, dims).reshape(-1, dims).cuda()
+        centers_ = centers.unsqueeze(0).expand(bs, clses, kers, dims)
         q = q.unsqueeze(1).expand(bs, clses, kers * dims).reshape(-1, dims)
+        
+        # centers_ = centers_.reshape(-1, dims).cuda()
+        # q = q.reshape(-1, dims)
 
-        # results = F.kl_div(q, centers_, reduction='none').sum(-1).reshape(-1, clses, kers)
-        # results = (results * gmm_weights.cuda()).sum(-1)
-        # results = torch.argmin(results, 1)
-
-        # results = torch.cosine_similarity(q, centers_, dim=1).reshape(clses, -1, kers)
+        # results = torch.cosine_similarity(q, centers_, dim=1).reshape(-1, clses, kers)
         # flag = (gmm_weights != 0).sum(0) == 100
         # results = (results[:, :, flag] * gmm_weights[:, flag].cuda()).sum(-1)
-        # results = torch.argmax(results, 0)
-        results = torch.cosine_similarity(q, centers_, dim=1).reshape(-1, clses, kers)
-        # # results = (results * gmm_weights.cuda()).sum(-1)
-        flag = (gmm_weights != 0).sum(0) == 100
-        results = (results[:, :, flag] * gmm_weights[:, flag].cuda()).sum(-1)
+        # results = torch.argmax(results, 1)
+
+        centers_ = centers_.reshape(-1, clses, kers * dims).cuda()
+        q = q.reshape(-1, clses, kers * dims)
+
+        results = torch.cosine_similarity(q, centers_, dim=-1)
         results = torch.argmax(results, 1)
 
         acc.update(results, cls)

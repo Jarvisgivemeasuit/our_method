@@ -17,22 +17,21 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
+import datetime
+import math
 import os
+import random
+import subprocess
 import sys
 import time
-import math
-import random
-import datetime
-import subprocess
 from collections import defaultdict, deque
 
 import numpy as np
 import torch
-from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
-from sklearn.metrics import accuracy_score, roc_curve, roc_auc_score
-
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+from torch import nn
 
 
 class GaussianBlur(object):
@@ -838,6 +837,7 @@ def multi_scale(samples, model):
     v /= v.norm()
     return v
 
+# ==================function added by Grey======================
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -875,8 +875,171 @@ class Accuracy:
         self.num_instance = 0
 
 
-
 # calculate the TNR@TPR95
 def calc_tnr(target, output):
     fpr, tpr, thresholds = roc_curve(target, output)
     return 1 - fpr[np.argmax(tpr>=.95)]
+
+
+def get_fvs(q, maha, ind_mean, ind_cov, gmm_weights, picov):
+    '''
+    Args: 
+        q:           Sample features extracted from backbone with 
+                     shape (num_samples, kernels, dims)
+        maha:        Mahalanobis distance with shape(num_samples, classes, kernels)
+        ind_mean:    Means of the whole training set with shape (classes, kernels, dims)
+        ind_cov:     Covariances of the whole training set with 
+                     shape (classes, kernels, dims, dims)
+        gmm_weights: A series of weights of gaussian mixture model with 
+                     shape(classes, kernels)
+        picov:       The denominator of the probability density function (√2πΣ)
+                     with shape (classes, kernels)
+    
+    Return:
+        fvs:         Fisher Vectors with shape (num_samples, classes, kernels, 2×dims)
+    '''
+    sams, cls, kers = maha.shape
+    dims = ind_mean.shape[-1]
+    probs = get_prob(maha, picov)
+    fvs = torch.Tensor().double().cuda()
+
+    for c in range(cls):
+        cov_diag = get_diag(ind_cov[c])
+        cov_diag = cov_diag.unsqueeze(0).expand_as(q)
+
+        q_norm = (q - ind_mean[c]) / cov_diag
+        prob   = probs[:, c:c+1].unsqueeze(-1).expand(sams, 1, kers, dims)
+
+        gamma_mu    = prob * q_norm
+        gamma_sigma = prob * (q_norm ** 2 - 1)
+
+        gamma_mu    = (gamma_mu.permute(0, 1, 3, 2) * \
+                       torch.pow(gmm_weights[c], -0.5)).permute(0, 1, 3, 2)
+        gamma_sigma = (gamma_mu.permute(0, 1, 3, 2) * \
+                       torch.pow(2 * gmm_weights[c], -0.5)).permute(0, 1, 3, 2)
+
+        fisher_vector = torch.cat([gamma_mu, gamma_sigma], dim=-1)
+        fvs = torch.cat([fvs, fisher_vector], dim=1)
+        break
+    return fvs
+
+
+def get_maha_score(mean, cov_inv, gmm_weights, x):
+    '''
+    Args:
+        x:           features of input with shape (num_samples, kernels, dimensions)
+        mean:        centers of gmm of all classes with shape (classes, kernels, dimensions)
+        det_sigma:   Determinant of covariance matrix with shape (classes, kernels)
+        cov_inv:     The inverse matrix of sigma which has 
+                     shape (classes, kernels, dimensions, dimensions)
+        gmm_weights: weights of gmm with shape (classes, kernels)
+        
+    Return:
+        mahas:       Mahalanobis distance with shape(num_samples, classes, kernels)
+    '''
+
+    cls, kers, dims = mean.shape
+    num = x.shape[0]
+
+    for cls_idx in range(cls):
+        # expand mean and cov+inv
+        mean_ = mean[cls_idx:cls_idx+1].expand(num, kers, dims)
+        cov_inv_ = cov_inv[cls_idx:cls_idx+1].expand(num, kers, dims, dims)
+
+        # reshape for calculation
+        x = x.reshape(-1, 1, dims).double()
+        mean_ = mean_.reshape(-1, 1, dims).double()
+        cov_inv_ = cov_inv_.reshape(-1, dims, dims)
+
+        # calculate the maha distance: (x-μ)Σ^(-1)(x-μ)^T
+        maha = torch.bmm((x - mean_), cov_inv_)
+        maha =  0.5 * torch.bmm(maha, (x - mean_).permute(0, 2, 1)).reshape(num, 1, kers)
+        maha = (maha * gmm_weights[cls_idx])
+
+        if cls_idx == 0:
+            mahas = maha
+        else:
+            mahas = torch.cat([mahas, maha], dim=1)
+
+    return mahas
+
+
+def get_cls_maha_score(mean, cov_inv, gmm_weights, x, cls_idx):
+    '''
+    Args:
+        x:           Features of input with shape (num_samples, kernels, dimensions)
+        mean:        Centers of gmm of all classes with shape (classes, kernels, dimensions)
+        det_sigma:   Determinant of covariance matrix with shape (classes, kernels)
+        cov_inv:     The inverse matrix of sigma which has 
+                     shape (classes, kernels, dimensions, dimensions)
+        gmm_weights: weights of gmm with shape (classes, kernels)
+        cls_idx:     A list indicates the index of a series of classes with shape (num_samples)
+        
+    Return:
+        mahas:       Mahalanobis distance with shape(num_samples, kernels)
+    '''
+
+    cls, kers, dims = mean.shape
+    num = x.shape[0]
+
+    # expand mean and cov+inv
+    mean_ = mean[cls_idx]
+    cov_inv_ = cov_inv[cls_idx]
+
+    # reshape for calculation
+    x = x.reshape(-1, 1, dims).double()
+    mean_ = mean_.reshape(-1, 1, dims).double()
+    cov_inv_ = cov_inv_.reshape(-1, dims, dims)
+
+    # calculate the maha distance: (x-μ)Σ^(-1)(x-μ)^T
+    maha = torch.bmm((x - mean_), cov_inv_)
+    maha =  0.5 * torch.bmm(maha, (x - mean_).permute(0, 2, 1)).reshape(num, kers)
+    maha = (maha * gmm_weights[cls_idx])
+    return maha
+
+
+def get_prob(maha, picov):
+    '''
+    Args:
+        mahas: Mahalanobis distance with shape(num_samples, classes, kernels)
+        picov: The denominator of the probability density function (√2πΣ)
+               with shape (classes, kernels)
+        
+    Return:
+        prob:  A series of robabilities denote as γi(x) refered in Fisher Vectors 
+               with shape (num_samples, classes, kernels)
+    '''
+    min_maha, _ = maha.min(-1)
+    exponent = -0.5 * (maha.permute(2, 0, 1) - min_maha).permute(1, 2, 0)
+
+    mole = torch.exp(exponent) / picov
+    dens = (mole).sum()
+    return mole / dens
+     
+    
+def get_picov(covs, i=None):
+    '''
+    Args:
+        covs:  Covariances with shape (classes, kernels, dims, dims) of the
+               whole training set or a class
+        i:     A scalar indicating the index of the specified category. Default
+               none means calculating covariances for the whole training set
+    Return:
+        picov: The denominator of the probability density function (√2πΣ)
+               with shape (classes, kernels)
+    '''
+    picov = torch.sqrt(torch.linalg.det(covs * torch.pi * 2 * 1.25e11))
+    return picov[i] if i else picov
+    
+def get_diag(mats):
+    '''
+    Returns the diagnal elements of all mats.
+    '''
+    n_components = mats.shape[0]
+    diagnal = torch.Tensor().double().cuda()
+
+    for c in range(n_components):
+        diag = torch.diag(mats[c]).unsqueeze(0)
+        diagnal = torch.cat([diagnal, diag], dim=0)
+    
+    return diagnal

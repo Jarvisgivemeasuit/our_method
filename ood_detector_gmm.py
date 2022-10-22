@@ -63,23 +63,43 @@ def ood_detector(args):
         pin_memory=True,
         drop_last=True,
     )
-
-    val_transform = transforms.Compose([
+    test_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         # transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    val_in = get_dataset('val', 'onlyin', args.data_path, 0, val_transform)
-    sampler = torch.utils.data.distributed.DistributedSampler(val_in)
-    val_in_loader = torch.utils.data.DataLoader(
-        val_in,
-        sampler=sampler,
+
+    test_in = get_dataset('val', 'onlyin', args.data_path, 0, test_transform)
+    # Text
+    ood_path = '/home/ljl/Datasets/dtd/images'
+    # iNaturalist
+    ood_path = '/home/ljl/Datasets/iNaturalist/'
+    # SUN
+    ood_path = '/home/ljl/Datasets/SUN/'
+    # Places
+    ood_path = '/home/ljl/Datasets/Places/'
+
+    test_ood = datasets.ImageFolder(ood_path, transform=test_transform)
+    in_sampler = torch.utils.data.distributed.DistributedSampler(test_in)
+    ood_sampler = torch.utils.data.distributed.DistributedSampler(test_ood)
+    test_in_loader = torch.utils.data.DataLoader(
+        test_in,
+        sampler=in_sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    print(f"Data loaded with {len(dataset_train)} train imgs and {len(val_in)} val imgs.")
+    test_ood_loader = torch.utils.data.DataLoader(
+        test_ood,
+        sampler=ood_sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    print(f"""Data loaded with {len(dataset_train)} train imgs and 
+            {len(test_in)} ind test imgs, {len(test_ood)} ood test imgs.""")
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
@@ -149,17 +169,7 @@ def ood_detector(args):
                 epoch, args.n_last_blocks, args.avgpool_patchtokens, 
                 mu, det_sigma, sigma_inv, gmm_weights, auroc, fpr95, acc)
         scheduler.step()
-
-        # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-        #              'epoch': epoch}
-        if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            au, fpr = validate_network(val_loader, model, classifier, args.n_last_blocks, args.avgpool_patchtokens, centers, variance, auroc, fpr95, acc)
-            print(f"Auroc at epoch {epoch} of the network on the {len(dataset_val)} test images: {au:.2f}%")
-            best_auroc = max(best_auroc, au)
-            best_fpr = min(best_fpr, fpr)
-            print(f'Max auroc so far: {best_auroc:.2f}%, min fpr so far:{best_fpr:.2f}')
-            # log_stats = {**{k: v for k, v in log_stats.items()},
-            #              **{f'test_{k}': v for k, v in test_stats.items()}}
+        
         if utils.is_main_process():
             # with (Path(args.output_dir) / "log.txt").open("a") as f:
             #     f.write(json.dumps(log_stats) + "\n")

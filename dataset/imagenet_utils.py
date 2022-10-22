@@ -29,15 +29,15 @@ def get_cls_file(path, num_classes, k=1):
     ood_cls_index = np.delete(cls_index, ind_cls_index)
     ind_cls_list, ood_cls_list = path_list[ind_cls_index].tolist(), path_list[ood_cls_index].tolist()
 
-    with open(f'ind_cls_imagnet_{k}.txt', 'w') as f:
+    with open(f'ind_imagnet_{num_classes}cls.txt', 'w') as f:
         for cls in ind_cls_list:
             f.write(cls+'\n')
         f.close()
 
-    with open(f'ood_cls_{1000-num_classes}.txt', 'w') as f:
-        for cls in ood_cls_list:
-            f.write(cls+'\n')
-        f.close
+    # with open(f'ood_cls_{1000-num_classes}.txt', 'w') as f:
+    #     for cls in ood_cls_list:
+    #         f.write(cls+'\n')
+    #     f.close()
 
 @run_time
 def make_ind_datasets(mode, data_domain, num_classes, target_path):
@@ -84,8 +84,10 @@ def make_ood_dataset(num_classes, k=1):
 
 if __name__ == '__main__':
     path = '/home/ljl/Datasets/ImageNet/train'
-    k = 2
-    get_cls_file(path, 100, k=k)
+    k = 0
+    num_classes = [50, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    for num_cls in num_classes:
+        get_cls_file(path, num_cls, k=k)
     # mode = 'train'
     # tar_path = f'/home/et21-lijl/Datasets/Imagenet100/{mode}'
     # data_domain = 'ind'
@@ -95,4 +97,4 @@ if __name__ == '__main__':
     # mode = 'val'
     # tar_path = f'/home/et21-lijl/Datasets/Imagenet100/{mode}'
     # make_ind_datasets(mode, data_domain, num_classes, tar_path)
-    make_ood_dataset(100, k=k)
+    # make_ood_dataset(100, k=k)

@@ -1,58 +1,58 @@
-import os
-from socket import timeout
-import sys
 import argparse
-import math
-import numpy as np
+import os
+from time import process_time_ns, time
 
+import numpy as np
 import torch
-from torch import nn
-import torch.backends.cudnn as cudnn
-from torch.nn import functional as F
+import torch.nn.functional as F
+from progress.bar import Bar
+from sklearn.covariance import EmpiricalCovariance
+from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from torchvision import datasets
-from torchvision import transforms
 from torchvision import models as torchvision_models
+from torchvision import transforms
 
 import utils
-from backbones import select_backbone
-from progress.bar import Bar
-from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score
+import vision_transformer as vits
+from dataset.imagenet import Imagenet
 
 
-def test(args):
-    # ============ building network ... ============
-    model = select_backbone(args.arch, num_classes=args.num_labels).cuda()
-    state_dict = torch.load(args.pretrained_weights)
-    model.load_state_dict(state_dict)
-    print(f"Model {args.arch} built.")
+def calculate_ind_acc(args):
+    utils.init_distributed_mode(args)
 
-    classifier = Classifier(args.out_dim, num_labels=1).cuda()
-    classifier = classifier.cuda()
-    checkpoint = torch.load(args.classifier_weights, map_location="cpu")
-    classifier.load_state_dict(checkpoint['state_dict'], strict=False)
-    print('Classifier built.')
+    model = torchvision_models.__dict__[args.arch]()
+    embed_dim = model.fc.weight.shape[1]
+    model = utils.MultiCropWrapper(
+        model,
+        vits.DINOHead(embed_dim, args.out_dim, False),
+    )
 
-    mean = [x / 255 for x in [125.3, 123.0, 113.9]]
-    std = [x / 255 for x in [63.0, 62.1, 66.7]]
+    _, gmm_weights = load_pretrained_weights(model, args.pretrained_weights, 'teacher')
+    means, covs_inv = get_gaussian(args.pretrained_weights)
+    model.cuda()
+    model.eval()
 
-    test_transform = transforms.Compose([transforms.RandomCrop(32),
-                                        transforms.ToTensor(), 
-                                        transforms.Normalize(mean, std)])
-
-    in_data = get_dataset('test', args.data_path_in, test_transform)
-    in_loader = torch.utils.data.DataLoader(in_data, 
-                        batch_size=args.batch_size_per_gpu, 
-                        shuffle=False,
-                        num_workers=args.num_workers,
-                        pin_memory=True,
-                        timeout=2
-                        )
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    in_data = get_dataset('val', args.in_data_path, args.num_labels, transform)
+    sampler = torch.utils.data.distributed.DistributedSampler(in_data)
+    in_loader = torch.utils.data.DataLoader(
+        in_data,
+        sampler=sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
     print(f'Data loaded with {len(in_data)} in-distribuion test images.')
-    results_in = get_scores(model, classifier, in_loader)
+    results_in = get_scores(model, in_loader, means, covs_inv, gmm_weights, args.threshold)
 
     # Texture dataset
-    ood_data = datasets.ImageFolder('/home/ljl/Datasets/dtd/images', transform=test_transform)
+    ood_data = datasets.ImageFolder('/home/ljl/Datasets/dtd/images', transform=transform)
     ood_loader = torch.utils.data.DataLoader(ood_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=True,
@@ -60,7 +60,8 @@ def test(args):
                         pin_memory=True
                         )
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
+    results_out = get_scores(model, ood_loader, means, covs_inv, gmm_weights, args.threshold)
+    auroc, fpr95, aupr = get_results(results_in, results_out)
     print("Texture Detection")
     print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
     print()
@@ -119,14 +120,24 @@ def test(args):
     auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
     print("iSUN Detection")
     print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
-    print()
 
 
-@torch.no_grad()
-def get_scores(model, classifier, loader):
-    classifier.eval()
+def get_results(res_in, res_out):
+    tar_in, tar_out = np.zeros(len(res_in)), np.ones(len(res_out))
+    res, tar = [], []
+    res.extend(res_in)
+    res.extend(res_out)
+    tar.extend(tar_in.tolist())
+    tar.extend(tar_out.tolist())
+    
+    auroc = calc_auroc(res, tar)
+    fpr95 = calc_fpr(res, tar)
+    aupr = average_precision_score(tar, res)
+    return auroc, fpr95, aupr
+    
+
+def get_scores(model, loader, means, covs_inv, gmm_weights, threshold):
     num_iter = len(loader)
-
     bar = Bar('Getting results:', max=num_iter)
     results = []
 
@@ -135,11 +146,10 @@ def get_scores(model, classifier, loader):
         inp = inp.cuda(non_blocking=True)
         # forward
         with torch.no_grad():
-            output = model.intermediate_forward(inp)
-            output = output.reshape(output.shape[0], -1)
-            output = classifier(output)
-
-        output = torch.sigmoid(output).cpu().data.numpy()
+            _, q = model(inp)
+        maha = get_maha_score(means, covs_inv, gmm_weights, q.reshape(-1, 32, 256))
+        output = (maha > threshold).int().cpu().tolist()
+        print(maha)
         results.extend(output)
 
         bar.suffix = '({batch}/{size}) | Total:{total:} | ETA:{eta:}'.format(
@@ -150,23 +160,8 @@ def get_scores(model, classifier, loader):
             )
         bar.next()
     bar.finish()
+    print(1 - sum(results) / len(results))
     return results
-
-
-def get_results(model, classifier, loader, results_in):
-    results_out = get_scores(model, classifier, loader)
-
-    results = []
-    results.extend(results_in)
-    results.extend(results_out)
-
-    targets = np.hstack((np.zeros_like(results_in), np.ones_like(results_out)))
-
-    auroc = calc_auroc(results, targets)
-    fpr95 = calc_fpr(results, targets)
-    aupr = average_precision_score(targets, results)
-
-    return auroc * 100, fpr95 * 100, aupr * 100
 
 
 def get_maha_score(mu, cov_inv, gmm_weights, x):
@@ -180,71 +175,59 @@ def get_maha_score(mu, cov_inv, gmm_weights, x):
     '''
     cls, kers, dims = mu.shape
     num = x.shape[0]
-    # expand x with the same shape with mu
-    x = x.unsqueeze(1).expand(num, cls, kers, dims)
-    mu = mu.expand_as(x)
-    cov_inv = cov_inv.expand(num, *cov_inv.shape[:])
-    # print(x.shape, mu.shape, cov_inv.shape)
-
-    # reshape for calculation
-    x = x.reshape(-1, 1, dims)
-    mu = mu.reshape(-1, 1, dims)
-    # cov_inv = cov_inv.reshape(-1, dims, dims)
 
     for i in range(cls):
-    # calculate the maha distance: (x-μ)Σ^(-1)(x-μ)^T
-        maha = torch.bmm((x - mu), cov_inv[i])
-        maha =  0.5 * torch.bmm(maha, (x - mu).permute(0, 2, 1)).reshape(num, 1, kers)
-        maha = (maha.cpu() * gmm_weights).sum(-1)
-        if i == 1:
+        # expand mean and cov+inv
+        mu_ = mu[i:i+1].expand(num, kers, dims)
+        cov_inv_ = cov_inv[i:i+1].expand(num, kers, dims, dims)
+
+        # reshape for calculation
+        x = x.reshape(-1, 1, dims).double()
+        mu_ = mu_.reshape(-1, 1, dims).double()
+        cov_inv_ = cov_inv_.reshape(-1, dims, dims)
+
+        # calculate the maha distance: (x-μ)Σ^(-1)(x-μ)^T
+        maha = torch.bmm((x - mu_), cov_inv_)
+        maha =  0.5 * torch.bmm(maha, (x - mu_).permute(0, 2, 1)).reshape(num, 1, kers)
+        maha = (maha.cpu() * gmm_weights[i]).sum(-1)
+        if i == 0:
             mahas = maha
         else:
             mahas = torch.cat([mahas, maha], dim=1)
-    min_maha = mahas.min(1)
+    min_maha, _ = mahas.min(1)
+    # print(min_maha)
 
     return min_maha
 
     
 def get_gaussian(pretrained_weights):
-    gau_path = (os.path.join(*pretrained_weights.split('/')[:-1]))
-    means = torch.load(os.path.join(gau_path, 'means.pt'))
-    covs_inv = torch.load(os.path.join(gau_path, 'covs_inv.pt'))
+    gau_path = ('/' + os.path.join(*pretrained_weights.split('/')[:-1]))
+    means = torch.load(os.path.join(gau_path, 'means.pt')).cuda()
+    covs_inv = torch.load(os.path.join(gau_path, 'covs_inv.pt')).cuda()
     return means, covs_inv
 
 
-def get_dataset(mode, data_path, transform):
-    if 'cifar10/' in data_path and mode == 'train':
-        return datasets.CIFAR10(data_path, train=True, transform=transform)
-    elif 'cifar10/' in data_path:
-        return datasets.CIFAR10(data_path, train=False, transform=transform)
-    elif 'cifar100/' in data_path and mode == 'train':
-        return datasets.CIFAR100(data_path, train=True, transform=transform)
-    elif 'cifar100/' in data_path:
-        return datasets.CIFAR100(data_path, train=False, transform=transform)
-    elif 'tiny-imagenet-200' in data_path:
-        return datasets.ImageFolder(os.path.join(data_path, mode), transform=transform)
+def load_pretrained_weights(model, pretrained_weights, checkpoint_key):
+    if os.path.isfile(pretrained_weights):
+        state_dict = torch.load(pretrained_weights, map_location="cpu")
+        if 'center_loss' in state_dict.keys():
+            centers = state_dict['center_loss']['centers']
+            gmm_weights = state_dict['center_loss']['gmm_weights']
+
+        if checkpoint_key is not None and checkpoint_key in state_dict:
+            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            state_dict = state_dict[checkpoint_key]
+        # remove `module.` prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        msg = model.load_state_dict(state_dict, strict=False)
+        print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
+    return centers, gmm_weights
 
 
-class Classifier(nn.Module):
-    def __init__(self, embed_dim, num_labels):
-        super().__init__()
-        self.embed_dim = embed_dim
-        # self.model = vits.vit_onelayer(embed_dim=self.embed_dim)
-
-        self.classifier = nn.Sequential(nn.Linear(embed_dim * 8, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, embed_dim * 3),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim * 3, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, num_labels))
-
-    def forward(self, x):
-        out = self.classifier(x).reshape(x.shape[0])
-        return out
-
+def get_dataset(mode, data_path, num_cls, transform):
+    if 'ImageNet' in data_path:
+        return Imagenet(mode, data_path, num_cls, transform)
+    
 
 def calc_fpr(scores, trues):
     tpr95=0.95
@@ -266,47 +249,25 @@ def calc_auroc(scores, trues):
 
     return result
 
-
-def make_sure_path_exists(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-    return path
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Evaluation with linear classification on ImageNet')
-    parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens
-        for the `n` last blocks. We use `n=4` when evaluating ViT-Small and `n=1` with ViT-Base.""")
-    parser.add_argument('--avgpool_patchtokens', default=False, type=utils.bool_flag,
-        help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
-        We typically set this to False for ViT-Small and to True with ViT-Base.""")
     parser.add_argument('--arch', default='vit_small', type=str, help='Architecture')
-    parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
     parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
-    parser.add_argument('--classifier_weights', default='', type=str, help="Path to classifier pretrained weights to evaluate.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
-    parser.add_argument("--lr", default=0.05, type=float, help="""Learning rate at the beginning of
-        training (highest LR used during training). The learning rate is linearly scaled
-        with the batch size, and specified here for a reference batch size of 256.
-        We recommend tweaking the LR depending on the checkpoint evaluated.""")
     parser.add_argument('--batch_size_per_gpu', default=128, type=int, help='Per-GPU batch-size')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path_in', default='/path/to/imagenet/', type=str)
-    parser.add_argument('--data_path_out', default='/path/to/imagenet/', type=str)
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
-    parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
     parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
+    parser.add_argument('--in_data_path', default='/path/to/imagenet/', type=str)
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-
+    parser.add_argument('--threshold', default=500, type=int, help='The threshold for discriminating OOD samples')
     parser.add_argument('--out_dim', default=8192, type=int, help="""Dimensionality of
         the DINO head output. For complex and large datasets large values (like 65k) work well.""")
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
         help="Whether to use batch normalizations in projection head (Default: False)")
-    parser.add_argument('--k', default=1, type=int, help='Number of random split')
     args = parser.parse_args()
-    test(args)
-    # calculate_var_inverse(args)
+    calculate_ind_acc(args)

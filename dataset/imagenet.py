@@ -7,6 +7,7 @@ from PIL import Image
 import numpy as np
 from torchvision import transforms
 
+cv2.setNumThreads(1)
 
 class Imagenet(Dataset):
     '''
@@ -15,7 +16,7 @@ class Imagenet(Dataset):
         mode: Specifies the dataset to train or test.
         data_domain: Determines this dataset as IND or OOD.
     '''
-    def __init__(self, mode, data_path, k, transform=None) -> None:
+    def __init__(self, mode, data_path, num_cls, transform=None) -> None:
         super().__init__()
         assert mode in ['train', 'val']
 
@@ -24,8 +25,9 @@ class Imagenet(Dataset):
         self.imagenet_path = os.path.join(data_path, mode)
         self.classes, self.img_list = {}, []
 
-        with open(f'/home/ljl/Documents/our_method/dataset/ind_imagenet_{k}.txt', 'r') as f:
+        with open(f'/home/ljl/Documents/our_method/dataset/ind_imagenet_{num_cls}cls.txt', 'r') as f:
             for idx, line in enumerate(f):
+
                 cls_name = line.strip()
                 self.classes[cls_name] = idx
 
@@ -40,7 +42,9 @@ class Imagenet(Dataset):
         cls_name = img_name.split('/')[0]
         cls_label = self.classes[cls_name]
 
-        img = Image.open(os.path.join(self.imagenet_path, img_name)).convert('RGB')
+        # img = Image.open(os.path.join(self.imagenet_path, img_name)).convert('RGB')
+        img = cv2.imread(os.path.join(self.imagenet_path, img_name), cv2.IMREAD_COLOR)
+        img = Image.fromarray(img)
         if self.transform:
             img = self.transform(img)
         else:

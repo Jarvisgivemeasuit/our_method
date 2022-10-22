@@ -12,31 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import datetime
+import json
+import math
 import os
 import sys
-import datetime
 import time
-import math
-import json
 from pathlib import Path
-from dataset.inat import INATURALIST
 
+import cv2
 import numpy as np
-from PIL import Image
 import torch
-import torch.nn as nn
-import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import datasets, transforms
+from PIL import Image
+from torchvision import datasets
 from torchvision import models as torchvision_models
+from torchvision import transforms
 
 import utils
 import vision_transformer as vits
-from vision_transformer import DINOHead
-from dataset.imagenet import Imagenet
 from dataset.ifood import IFOOD
+from dataset.imagenet import Imagenet
 from dataset.inat import INATURALIST
+from vision_transformer import DINOHead
+
+cv2.setNumThreads(1)
+torch.set_num_threads(1)
 
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
@@ -97,6 +101,8 @@ def get_args_parser():
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--center_stop_epochs', default=80, type=int, help='''Number of epochs of last training
         procedure without center updating.''')
+    parser.add_argument('--feat_start_epoch', default=0, type=int, help='''epoch where feature learn from centers''')
+
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
@@ -153,7 +159,7 @@ def train_dino(args):
         args.local_crops_number,
     )
     # dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    dataset = get_dataset('train', args.data_path, args.k, transform)
+    dataset = get_dataset('train', args.data_path, args.num_labels, transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -360,7 +366,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
-            if epoch < args.epochs - args.center_stop_epochs:
+            if epoch % 5 == 1 and epoch < args.epochs - args.center_stop_epochs:
                 center_optim.step()
         else:
             fp16_scaler.scale(loss).backward()
@@ -371,7 +377,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
-            if epoch < args.epochs - args.center_stop_epochs:
+            if epoch % 5 == 1 and epoch < args.epochs - args.center_stop_epochs:
                 fp16_scaler.step(center_optim)
             fp16_scaler.update()
 
@@ -562,10 +568,10 @@ class EnhancedCenterLoss(nn.Module):
 
         if use_gpu:
             self.centers = nn.Parameter(torch.randn(self.centers_shape).cuda())
-            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]).cuda(), requires_grad=False)
+            self.gmm_weights = nn.Parameter(torch.softmax(torch.randn(num_classes, feat_dim[0]), dim=-1).cuda(), requires_grad=False)
         else:
             self.centers = nn.Parameter(torch.randn(self.centers_shape))
-            self.gmm_weights = nn.Parameter(torch.zeros(num_classes, feat_dim[0]), requires_grad=False)
+            self.gmm_weights = nn.Parameter(torch.softmax(torch.randn(num_classes, feat_dim[0]), dim=-1), requires_grad=False)
 
     def forward(self, gmm_weights, x, labels, gamma, epoch, args):
         """
@@ -593,12 +599,20 @@ class EnhancedCenterLoss(nn.Module):
             loss = (kl_x.clone().detach() * F.softmax(gmm_weights[i], dim=-1)).mean()
             total_loss += loss
 
-            if epoch > 15 and epoch < args.epochs - args.center_stop_epochs:
+            if epoch > args.feat_start_epoch and epoch < args.epochs - args.center_stop_epochs:
                 kl = (kl_ce + kl_x)
             elif epoch > args.epochs - args.center_stop_epochs:
-                kl = kl_x
+                pull = F.mse_loss(x[i], center.clone().detach())
+                kl = kl_x + pull
             else:
                 kl = kl_ce
+
+            # if epoch % 5 == 1 and epoch < args.epochs - args.center_stop_epochs:
+            #     kl = (kl_ce + kl_x)
+            # else:
+            #     kl = kl_x
+            # else:
+            #     kl = kl_ce
 
             loss = torch.clamp(kl, min=1e-5, max=1e+5).mean()
             total_loss += loss
@@ -638,9 +652,9 @@ class EnhancedCenterLoss(nn.Module):
         return total_loss / 2
 
 
-def get_dataset(mode, data_path, k, transform):
+def get_dataset(mode, data_path, num_cls, transform):
     if 'ImageNet' in data_path:
-        return Imagenet(mode, data_path, k, transform)
+        return Imagenet(mode, data_path, num_cls, transform)
 
 
 if __name__ == '__main__':

@@ -255,25 +255,28 @@ def vit_base(patch_size=16, **kwargs):
 
 
 class Vit_Onelayer(nn.Module):
-    def __init__(self,embed_dim, **kwargs):
+    def __init__(self,embed_dim, num_label, **kwargs):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.model = nn.Sequential(
-        nn.Linear(embed_dim, 1024),
+        nn.Linear(embed_dim, 512),
         Block(
-                dim=1024, num_heads=4, mlp_ratio=4, qkv_bias=True, qk_scale=None,
+                dim=512, num_heads=4, mlp_ratio=4, qkv_bias=True, qk_scale=None,
                 drop=0., attn_drop=0., drop_path=0., norm_layer=partial(nn.LayerNorm, eps=1e-6)), 
-        partial(nn.LayerNorm, eps=1e-6)(1024))
+        partial(nn.LayerNorm, eps=1e-6)(512))
+        self.classifier = nn.Linear(512, num_label)
 
     def forward(self, x):
         B, N, C = x.shape
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.model(x)
-        return x[:, 0]
+        out = self.classifier(x[:, 0])
+
+        return out
         
-def vit_onelayer(embed_dim, **kwargs):
-    model = Vit_Onelayer(embed_dim)
+def vit_onelayer(embed_dim, num_label, **kwargs):
+    model = Vit_Onelayer(embed_dim, num_label)
     return model
 
 
