@@ -32,6 +32,7 @@ import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
 from torch import nn
+import torch.nn.functional as F
 
 
 class GaussianBlur(object):
@@ -969,10 +970,9 @@ def get_cls_maha_score(mean, cov_inv, gmm_weights, x, cls_idx):
     Args:
         x:           Features of input with shape (num_samples, kernels, dimensions)
         mean:        Centers of gmm of all classes with shape (classes, kernels, dimensions)
-        det_sigma:   Determinant of covariance matrix with shape (classes, kernels)
         cov_inv:     The inverse matrix of sigma which has 
                      shape (classes, kernels, dimensions, dimensions)
-        gmm_weights: weights of gmm with shape (classes, kernels)
+        gmm_weights: Weights of gmm with shape (classes, kernels)
         cls_idx:     A list indicates the index of a series of classes with shape (num_samples)
         
     Return:
@@ -981,7 +981,6 @@ def get_cls_maha_score(mean, cov_inv, gmm_weights, x, cls_idx):
 
     cls, kers, dims = mean.shape
     num = x.shape[0]
-
     # expand mean and cov+inv
     mean_ = mean[cls_idx]
     cov_inv_ = cov_inv[cls_idx]
@@ -1043,3 +1042,117 @@ def get_diag(mats):
         diagnal = torch.cat([diagnal, diag], dim=0)
     
     return diagnal
+
+
+def query_norm(means, covs_inv_diag, gmm_weights, q, tar):
+    '''
+    Args:
+        x:            Features of input with shape (num_samples, kernels, dimensions)
+        mean:         Centers of gmm of all classes with shape (classes, kernels, dimensions)
+        det_sigma:    Determinant of covariance matrix with shape (classes, kernels)
+        cov_inv_diag: The diagnoal elements of inverse matrix of sigma which has 
+                      shape (classes, kernels, dimensions)
+        gmm_weights:  Weights of gmm with shape (classes, kernels)
+        cls_idx:      A list indicates the index of a series of classes with shape (num_samples)
+    Return:
+        queries:      The features with shape (2 * num_samples, kernels, dimensions)
+                      after normalization
+        targets:      Binary targets for classifier with shape (2 * num_samples)
+    '''
+    batch, kers, dims = q.shape
+    cls = means.shape[0]
+    # Get the norm queries of the species to which all samples belong.
+    pos_query = get_norm_q(means, covs_inv_diag, gmm_weights, q, tar)
+    pos_tar   = torch.zeros_like(tar).float().cuda(non_blocking=True)
+
+    # Randomly select all categories to which the sample does not belong.
+    wait2del = [i * cls + tar[i] for i in range(len(tar))]
+    neg_tar  = np.array([range(cls)] * batch).reshape(batch, cls)
+    neg_tar  = np.delete(neg_tar, wait2del).reshape(batch, cls - 1)
+    neg_tar  = torch.tensor([random.choice(tar_pool) for tar_pool in neg_tar]).cuda(non_blocking=True)
+
+    # Get the maha distance between the sample and the selected category, marked as a negative sample.
+    neg_query = get_norm_q(means, covs_inv_diag, gmm_weights, q, neg_tar)
+    neg_tar   = torch.ones_like(neg_tar).float().cuda(non_blocking=True)
+
+    queries = torch.cat([pos_query, neg_query], dim=0)
+    targets = torch.cat([pos_tar, neg_tar], dim=0)
+    return queries, targets
+
+
+def get_norm_q(means, covs_inv_diag, gmm_weights, x, cls_idx):
+    mean   = means[cls_idx]
+    inv    = covs_inv_diag[cls_idx]
+    weight = gmm_weights[cls_idx]
+
+    norm   = (x - mean) / inv * weight
+
+    return norm
+
+
+def get_similarity(means, gmm_weights, x):
+    nums, kers, dims = x.shape
+    cls = means.shape[0]
+
+    x       = x.unsqueeze(1).expand(nums, cls, kers, dims)
+    mean    = means.unsqueeze(0).expand(nums, cls, kers, dims)
+    weights = gmm_weights.unsqueeze(0).expand(nums, cls, kers)
+
+    sim = torch.cosine_similarity(x, mean, dim=-1)
+    # sim = sim * weights
+    sim = torch.cat([sim, weights], dim=-1)
+
+    return sim
+
+
+def get_kldiv(means, gmm_weights, x):
+    nums, kers, dims = x.shape
+    cls = means.shape[0]
+
+    x       = x.unsqueeze(1).expand(nums, cls, kers, dims)
+    mean    = means.unsqueeze(0).expand(nums, cls, kers, dims)
+    weights = gmm_weights.unsqueeze(0).expand(nums, cls, kers)
+
+    kl   = F.kl_div(x, mean, reduction='none').sum(-1)
+    pull = F.mse_loss(x, mean, reduction='none').sum(-1)
+
+    # kl   = torch.cat([kl * weights, pull * weights], dim=-1)
+    # kl = torch.cat([kl, pull, weights], dim=-1)
+    kl = torch.cat([kl, weights], dim=-1)
+
+    return kl
+
+
+def detector_restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
+    """
+    Re-start from checkpoint
+    """
+    if not os.path.isfile(ckp_path):
+        return
+    print("Found checkpoint at {}".format(ckp_path))
+
+    # open checkpoint file
+    checkpoint = torch.load(ckp_path, map_location="cpu")
+
+    # key is what to look for in the checkpoint file
+    # value is the object to load
+    # example: {'state_dict': model}
+    for key, value in kwargs.items():
+        if key in checkpoint and value is not None:
+            try:
+                msg = value.load_state_dict(checkpoint[key], strict=False)
+                print("=> loaded '{}' from checkpoint '{}' with msg {}".format(key, ckp_path, msg))
+            except TypeError:
+                try:
+                    msg = value.load_state_dict(checkpoint[key])
+                    print("=> loaded '{}' from checkpoint: '{}'".format(key, ckp_path))
+                except ValueError:
+                    print("=> failed to load '{}' from checkpoint: '{}'".format(key, ckp_path))
+        else:
+            print("=> key '{}' not found in checkpoint: '{}'".format(key, ckp_path))
+
+    # re load variable important for the run
+    if run_variables is not None:
+        for var_name in run_variables:
+            if var_name in checkpoint:
+                run_variables[var_name] = checkpoint[var_name]

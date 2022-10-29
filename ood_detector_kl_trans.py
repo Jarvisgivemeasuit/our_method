@@ -32,23 +32,33 @@ def calculate_ind_acc(args):
     )
 
     _, gmm_weights = load_pretrained_weights(model, args.pretrained_weights, 'teacher')
-    means, covs, covs_inv = get_gaussian(args.pretrained_weights)
+    means, covs_inv = get_gaussian(args.pretrained_weights)
     means, covs_inv, gmm_weights = means.cuda(), covs_inv.cuda(), gmm_weights.cuda()
-    model.cuda().eval()
+    model.cuda()
+    model.eval()
 
-    # classifier = vits.vit_onelayer(embed_dim=args.num_labels, num_label=1)
-    classifier = Classifier(32, 1)
+    # classifier = vits.vit_onelayer(npatch=64, embed_dim=args.num_labels, num_label=1)
+    classifier = vits.vit_multilayer(npatch=96, embed_dim=args.num_labels, num_label=1, depth=6)
     classifier.cuda()
     classifier = nn.parallel.DistributedDataParallel(classifier, device_ids=[args.gpu])
 
     optimizer = torch.optim.SGD(
         classifier.parameters(),
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
+        lr=args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
         momentum=0.9,
         weight_decay=5e-5)
+    # optimizer = torch.optim.AdamW(classifier.parameters(), 
+    #                                 args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 128., 
+    #                                 weight_decay=5e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
-
     transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomResizedCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    
+    test_transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
@@ -66,7 +76,7 @@ def calculate_ind_acc(args):
     )
     print(f'Data loaded with {len(in_data)} in-distribuion train images.')
 
-    val_in_data = get_dataset('val', args.in_data_path, transform)
+    val_in_data = get_dataset('val', args.in_data_path, test_transform)
     val_in_loader = torch.utils.data.DataLoader(val_in_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=False,
@@ -77,7 +87,7 @@ def calculate_ind_acc(args):
     print(f'Data loaded with {len(val_in_data)} in-distribuion test images.')
 
     # Texture dataset
-    ood_data = datasets.ImageFolder('/home/ljl/Datasets/dtd/images', transform=transform)
+    ood_data = datasets.ImageFolder('/home/ljl/Datasets/dtd/images', test_transform)
     val_out_loader = torch.utils.data.DataLoader(ood_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=True,
@@ -86,21 +96,37 @@ def calculate_ind_acc(args):
                         )
 
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    for epoch in range(args.epochs):
+
+    to_restore = {'epoch':0}
+    utils.detector_restart_from_checkpoint(
+        os.path.join(args.output_dir, 'classifier.pt'),
+        run_variables=to_restore,
+        classifier=classifier,
+        optimizer=optimizer,
+    )
+
+    start_epoch = to_restore["epoch"]
+    for epoch in range(start_epoch, args.epochs):
         train_classifier(model, classifier, optimizer, 
                          in_loader, means, covs_inv, gmm_weights, 
                          epoch, args.epochs)
         scheduler.step()
         auroc, fpr95, aupr = validation(model, classifier, val_in_loader, val_out_loader,
-                         means, covs_inv, gmm_weights)
-        torch.save(classifier.state_dict(), os.path.join(args.output_dir, 'classifier.pt'))
+                                        means, covs_inv, gmm_weights)
+        save_dict = {
+            'classifier':classifier.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch + 1,
+            'args': args,
+        }
+        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'classifier.pt'))
         if epoch % 5 == 0:
-            torch.save(classifier.state_dict(), os.path.join(args.output_dir, f'classifier{epoch:03}.pt'))
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'classifier{epoch:03}.pt'))
 
     
 
-def train_classifier(model, classifier, optim, loader, 
-                    means, covs_inv, gmm_weights, 
+def train_classifier(model, classifier, optim, 
+                    loader, means, covs_inv, gmm_weights, 
                     epoch, epochs):
     # picov = utils.get_picov(covs)
     num_iter = len(loader)
@@ -113,49 +139,34 @@ def train_classifier(model, classifier, optim, loader,
 
         inp   = inp.cuda(non_blocking=True)
         batch = inp.shape[0]
-        cls   = means.shape[0]
 
-        # tar_pool = tar.unique().tolist()
-        # for i in range(batch):
-        #     mix_1, mix_2 = random.sample(tar_pool, 2)
+        tar_pool = tar.unique().tolist()
+        for i in range(batch):
+            mix_1, mix_2 = random.sample(tar_pool, 2)
 
-        #     inp_pool1, inp_pool2 = inp[tar == mix_1], inp[tar == mix_2]
-        #     inp_1, inp_2 = random.choice(inp_pool1), random.choice(inp_pool2)
-        #     pseudo = 0.5 * inp_1 + 0.5 * inp_2
-        #     if i == 0:
-        #         pseudo_inp = pseudo.unsqueeze(0)
-        #     else:
-        #         pseudo_inp = torch.cat([pseudo_inp, pseudo.unsqueeze(0)], dim=0)
+            inp_pool1, inp_pool2 = inp[tar == mix_1], inp[tar == mix_2]
+            inp_1, inp_2 = random.choice(inp_pool1), random.choice(inp_pool2)
+            # ratio = random.uniform(0.4, 0.6)
+            ratio = 0.5
+            pseudo = ratio * inp_1 + (1-ratio) * inp_2
+            if i == 0:
+                pseudo_inp = pseudo.unsqueeze(0)
+            else:
+                pseudo_inp = torch.cat([pseudo_inp, pseudo.unsqueeze(0)], dim=0)
             
-        # inp    = torch.cat([inp, pseudo_inp], dim=0)
-        # target = torch.cat([torch.zeros_like(tar), torch.ones_like(tar)], dim=0).float().cuda()
-
+        inp    = torch.cat([inp, pseudo_inp], dim=0)
+        target = torch.cat([torch.zeros_like(tar), torch.ones(batch)], dim=0).float().cuda()
         # forward
         with torch.no_grad():
             _, q = model(inp)
             q = q.reshape(-1, 32, 256)
 
+        # sim = utils.get_similarity(means, gmm_weights, q)
+        kl = utils.get_kldiv(means, gmm_weights, q).permute(0, 2, 1)
+        # kl = utils.get_kldiv(means, gmm_weights, q)
         # maha = utils.get_maha_score(means, covs_inv, gmm_weights, q).permute(0, 2, 1)
-        # fvs    = utils.get_fvs(q, maha, means, covs_inv, gmm_weights, picov)
 
-        # Get the maha distance of the species to which all samples belong.
-        pos_maha = utils.get_cls_maha_score(means, covs_inv, gmm_weights, q, tar)
-        pos_tar  = torch.zeros_like(tar).float().cuda(non_blocking=True)
-
-        # Randomly select all categories to which the sample does not belong.
-        wait2del = [i * cls + tar[i] for i in range(len(tar))]
-        neg_tar  = np.array([range(cls)] * batch).reshape(batch, cls)
-        neg_tar  = np.delete(neg_tar, wait2del).reshape(batch, cls - 1)
-        neg_tar = torch.tensor([random.choice(tar_pool) for tar_pool in neg_tar]).cuda(non_blocking=True)
-
-        # Get the maha distance between the sample and the selected category, marked as a negative sample.
-        neg_maha = utils.get_cls_maha_score(means, covs_inv, gmm_weights, q, neg_tar)
-        neg_tar  = torch.ones_like(neg_tar).float().cuda(non_blocking=True)
-
-        maha   = torch.cat([pos_maha, neg_maha], dim=0)
-        target = torch.cat([pos_tar, neg_tar], dim=0)
-
-        output = classifier(maha.float()).flatten()
+        output = classifier(kl.float()).flatten()
         loss   = F.binary_cross_entropy_with_logits(output, target, reduction='none')
         loss   = loss.mean()
 
@@ -165,11 +176,10 @@ def train_classifier(model, classifier, optim, loader,
 
         # output, target = output.cpu(), target.cpu()
         output = torch.sigmoid(output)
-        # print(output.shape, target.shape)
         # output, target = output.tolist(), target.tolist()
         results = torch.cat((results, output), dim=0)
         targets = torch.cat((targets, target), dim=0)
-        acc = ((results >= 0.5) == targets).sum() / len(targets)
+        acc = ((results>=0.5) == targets).sum() / len(targets)
 
         # auroc, fpr, aupr = get_results(results.cpu().numpy(), targets.cpu().numpy())
         # bar.suffix = '({batch}/{size}) | BT:{bt:.2f} | Total:{total:} | ETA:{eta:} | Loss:{loss:.4f} | Acc:{acc:.4f} | AUROC:{auroc:.4f} | FPR95:{fpr:.4f} |AUPR:{aupr:.4f} | LR:{lr:.4f}'.format(
@@ -220,11 +230,13 @@ def classifier_inference(model, classifier, loader, means, covs_inv, gmm_weights
         # forward
         with torch.no_grad():
             _, q = model(inp)
+            q = q.reshape(-1, 32, 256)
         
-            maha = utils.get_maha_score(means, covs_inv, gmm_weights, q)
-            _, min_idx = torch.min(maha.mean(-1), dim=-1)
-            maha = maha[torch.tensor(range(maha.shape[0])), min_idx]
-            output = classifier(maha.float())
+            # sim = utils.get_similarity(means, gmm_weights, q)
+            # sim = utils.get_kldiv(means, gmm_weights, q)
+            sim = utils.get_kldiv(means, gmm_weights, q).permute(0, 2, 1)
+            # maha = utils.get_maha_score(means, covs_inv, gmm_weights, q).permute(0, 2, 1)
+            output = classifier(kl.float())
 
             output = torch.sigmoid(output).cpu().numpy()
             results.extend(output)
@@ -245,7 +257,7 @@ def get_gaussian(pretrained_weights):
     means    = torch.load(os.path.join(gau_path, 'means.pt')).cuda()
     covs     = torch.load(os.path.join(gau_path, 'covs.pt')).cuda()
     covs_inv = torch.load(os.path.join(gau_path, 'covs_inv.pt')).cuda()
-    return means, covs, covs_inv
+    return means, covs_inv
 
 
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key):
@@ -309,25 +321,6 @@ def calc_auroc(scores, trues):
     #calculate the AUROC
     result = roc_auc_score(trues, scores)
     return result
-
-
-class Classifier(nn.Module):
-    def __init__(self, embed_dim, num_labels):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.classifier = nn.Sequential(nn.Linear(embed_dim, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, embed_dim * 3),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim * 3, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, embed_dim),
-        nn.LeakyReLU(),
-        nn.Linear(embed_dim, num_labels))
-
-    def forward(self, x):
-        out = self.classifier(x).reshape(x.shape[0])
-        return out
 
     
 class Imagenet(Dataset):

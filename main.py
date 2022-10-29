@@ -347,7 +347,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, center_los
             _, teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             gmm_weights, student_output = student(images)
             dinoloss = dino_loss(student_output, teacher_output, epoch)
-            centerloss = center_loss(gmm_weights, student_output, labels, 1e-5, epoch, args) * 16
+            centerloss = center_loss(gmm_weights, student_output, labels, 1e-4, epoch, args) * 16
             loss = dinoloss + centerloss
 
         if not math.isfinite(loss.item()):

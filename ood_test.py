@@ -35,9 +35,12 @@ def test(args):
     mean = [x / 255 for x in [125.3, 123.0, 113.9]]
     std = [x / 255 for x in [63.0, 62.1, 66.7]]
 
-    test_transform = transforms.Compose([transforms.RandomCrop(32),
-                                        transforms.ToTensor(), 
-                                        transforms.Normalize(mean, std)])
+    test_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
 
     in_data = get_dataset('test', args.data_path_in, test_transform)
     in_loader = torch.utils.data.DataLoader(in_data, 

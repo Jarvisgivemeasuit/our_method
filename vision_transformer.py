@@ -255,9 +255,10 @@ def vit_base(patch_size=16, **kwargs):
 
 
 class Vit_Onelayer(nn.Module):
-    def __init__(self,embed_dim, num_label, **kwargs):
+    def __init__(self, npatch, embed_dim, num_label, **kwargs):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, npatch + 1, embed_dim))
         self.model = nn.Sequential(
         nn.Linear(embed_dim, 512),
         Block(
@@ -266,17 +267,108 @@ class Vit_Onelayer(nn.Module):
         partial(nn.LayerNorm, eps=1e-6)(512))
         self.classifier = nn.Linear(512, num_label)
 
+    def interpolate_pos_encoding(self, x, dim, scale=1):
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        if npatch == N:
+            return self.pos_embed
+        class_pos_embed = self.pos_embed[:, 0]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        dim = x.shape[-1]
+        dim0 = dim // 1
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        dim0 = dim0 + 0.1
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed.reshape(1, N, dim).permute(0, 2, 1),
+            scale_factor=(1 / scale),
+            mode='bicubic',
+        )
+        assert int(dim0) == patch_pos_embed.shape[-1]
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
     def forward(self, x):
         B, N, C = x.shape
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.interpolate_pos_encoding(x, C)
         x = self.model(x)
         out = self.classifier(x[:, 0])
 
         return out
-        
-def vit_onelayer(embed_dim, num_label, **kwargs):
-    model = Vit_Onelayer(embed_dim, num_label)
+
+
+class Vit_Multilayer(nn.Module):
+    def __init__(self, npatch, embed_dim, num_label, depth, drop_path_rate=0., **kwargs):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, npatch + 1, embed_dim))
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        self.linear = nn.Linear(embed_dim, 192)
+        self.blocks = nn.ModuleList([
+                Block(
+                dim=192, num_heads=3, mlp_ratio=4, qkv_bias=True, qk_scale=None,
+                drop=0., attn_drop=0., drop_path=dpr[i], norm_layer=partial(nn.LayerNorm, eps=1e-6))
+            for i in range(depth)])
+        self.norm = partial(nn.LayerNorm, eps=1e-6)(192)
+        self.classifier = nn.Linear(192, num_label)
+
+        # trunc_normal_(self.pos_embed, std=.02)
+        # trunc_normal_(self.cls_token, std=.02)
+        # self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def interpolate_pos_encoding(self, x, dim, scale=1):
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        if npatch == N:
+            return self.pos_embed
+        class_pos_embed = self.pos_embed[:, 0]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        dim = x.shape[-1]
+        dim0 = dim // 1
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        dim0 = dim0 + 0.1
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed.reshape(1, N, dim).permute(0, 2, 1),
+            scale_factor=(1 / scale),
+            mode='bicubic',
+        )
+        assert int(dim0) == patch_pos_embed.shape[-1]
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.interpolate_pos_encoding(x, C)
+        x = self.linear(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        out = self.classifier(x[:, 0])
+
+        return out
+
+  
+def vit_onelayer(npatch, embed_dim, num_label, **kwargs):
+    model = Vit_Onelayer(npatch, embed_dim, num_label)
+    return model
+
+
+def vit_multilayer(npatch, embed_dim, num_label, depth=6, **kwargs):
+    model = Vit_Multilayer(npatch, embed_dim, num_label, depth)
     return model
 
 

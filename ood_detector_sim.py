@@ -50,7 +50,9 @@ def calculate_ind_acc(args):
     )
 
     print(f'Data loaded with {len(in_data)} in-distribuion test images.')
-    results_in = get_scores(model, in_loader, centers, gmm_weights, args.threshold)
+    results_in = get_scores(model, in_loader, centers, gmm_weights)
+
+    aurocs, fpr95s, auprs = [], [], []
 
     # Texture dataset
     ood_data = datasets.ImageFolder('/home/ljl/Datasets/dtd/images', transform=transform)
@@ -61,14 +63,17 @@ def calculate_ind_acc(args):
                         pin_memory=True
                         )
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    results_out = get_scores(model, ood_loader, centers, gmm_weights, args.threshold)
+    results_out = get_scores(model, ood_loader, centers, gmm_weights)
     auroc, fpr95, aupr = get_results(results_in, results_out)
+    aurocs.append(auroc)
+    fpr95s.append(fpr95)
+    auprs.append(aupr)
     print("Texture Detection")
-    print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    print(f"AUROC:{auroc * 100:.2f}, FPR95:{fpr95 * 100:.2f}, AUPR:{aupr * 100:.2f}")
     print()
 
-    # SVHN dataset
-    ood_data = datasets.SVHN('/home/ljl/Datasets/SVHN', split='test', transform=test_transform)
+    # iNaturalist dataset
+    ood_data = datasets.ImageFolder('/home/ljl/Datasets/iNaturalist', transform=transform)
     ood_loader = torch.utils.data.DataLoader(ood_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=True,
@@ -76,13 +81,17 @@ def calculate_ind_acc(args):
                         pin_memory=True
                         )
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
-    print("SVHN Detection")
-    print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    results_out = get_scores(model, ood_loader, centers, gmm_weights)
+    auroc, fpr95, aupr = get_results(results_in, results_out)
+    aurocs.append(auroc)
+    fpr95s.append(fpr95)
+    auprs.append(aupr)
+    print("iNaturalist Detection")
+    print(f"AUROC:{auroc * 100:.2f}, FPR95:{fpr95 * 100:.2f}, AUPR:{aupr * 100:.2f}")
     print()
 
-    # LSUN-Crop dataset
-    ood_data = datasets.ImageFolder('/home/ljl/Datasets/LSUN', transform=test_transform)
+    # Places dataset
+    ood_data = datasets.ImageFolder('/home/ljl/Datasets/Places', transform=transform)
     ood_loader = torch.utils.data.DataLoader(ood_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=True,
@@ -90,13 +99,17 @@ def calculate_ind_acc(args):
                         pin_memory=True
                         )
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
-    print("LSUN-Crop Detection")
-    print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    results_out = get_scores(model, ood_loader, centers, gmm_weights)
+    auroc, fpr95, aupr = get_results(results_in, results_out)
+    aurocs.append(auroc)
+    fpr95s.append(fpr95)
+    auprs.append(aupr)
+    print("Places Detection")
+    print(f"AUROC:{auroc * 100:.2f}, FPR95:{fpr95 * 100:.2f}, AUPR:{aupr * 100:.2f}")
     print()
 
-    # LSUN-Resize dataset
-    ood_data = datasets.ImageFolder('/home/ljl/Datasets/LSUN_resize', transform=test_transform)
+    # SUN dataset
+    ood_data = datasets.ImageFolder('/home/ljl/Datasets/SUN', transform=transform)
     ood_loader = torch.utils.data.DataLoader(ood_data, 
                         batch_size=args.batch_size_per_gpu, 
                         shuffle=True,
@@ -104,27 +117,38 @@ def calculate_ind_acc(args):
                         pin_memory=True
                         )
     print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
-    print("LSUN-Resize Detection")
-    print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    results_out = get_scores(model, ood_loader, centers, gmm_weights)
+    auroc, fpr95, aupr = get_results(results_in, results_out)
+    aurocs.append(auroc)
+    fpr95s.append(fpr95)
+    auprs.append(aupr)
+    print("SUN Detection")
+    print(f"AUROC:{auroc * 100:.2f}, FPR95:{fpr95 * 100:.2f}, AUPR:{aupr * 100:.2f}")
     print()
 
-    # iSUN dataset
-    ood_data = datasets.ImageFolder('/home/ljl/Datasets/iSUN', transform=test_transform)
-    ood_loader = torch.utils.data.DataLoader(ood_data, 
-                        batch_size=args.batch_size_per_gpu, 
-                        shuffle=True,
-                        num_workers=args.num_workers,
-                        pin_memory=True
-                        )
-    print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
-    auroc, fpr95, aupr = get_results(model, classifier, ood_loader, results_in)
-    print("iSUN Detection")
-    print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    # # ImageNet-O dataset
+    # ood_data = datasets.ImageFolder('/home/ljl/Datasets/imagenet-o', transform=transform)
+    # ood_loader = torch.utils.data.DataLoader(ood_data, 
+    #                     batch_size=args.batch_size_per_gpu, 
+    #                     shuffle=True,
+    #                     num_workers=args.num_workers,
+    #                     pin_memory=True
+    #                     )
+    # print(f'Data loaded with {len(ood_data)} out-of-distribuion test images.')
+    # results_out = get_scores(model, ood_loader, centers, gmm_weights)
+    # auroc, fpr95, aupr = get_results(results_in, results_out)
+    # aurocs.append(auroc)
+    # fpr95s.append(fpr95)
+    # auprs.append(aupr)
+    # print("ImageNet-O Detection")
+    # print(f"AUROC:{auroc:.2f}, FPR95:{fpr95:.2f}, AUPR:{aupr:.2f}")
+    # print()
+    print('AVERAGE')
+    print(f"AUROC:{np.mean(aurocs) * 100:.2f}, FPR95:{np.mean(fpr95s) * 100:.2f}, AUPR:{np.mean(auprs) * 100:.2f}")
 
 
 def get_results(res_in, res_out):
-    tar_in, tar_out = np.zeros(len(res_in)), np.ones(len(res_out))
+    tar_in, tar_out = np.ones(len(res_in)), np.zeros(len(res_out))
     res, tar = [], []
     res.extend(res_in)
     res.extend(res_out)
@@ -137,7 +161,7 @@ def get_results(res_in, res_out):
     return auroc, fpr95, aupr
     
 
-def get_scores(model, loader, means, gmm_weights, threshold):
+def get_scores(model, loader, means, gmm_weights):
     num_iter = len(loader)
     bar = Bar('Getting results:', max=num_iter)
     results = []
@@ -148,9 +172,9 @@ def get_scores(model, loader, means, gmm_weights, threshold):
         # forward
         with torch.no_grad():
             _, q = model(inp)
-        scores = get_similarity_score(means, gmm_weights, q.reshape(-1, 32, 256))
-        output = (scores < threshold).int().cpu().tolist()
-        print(scores)
+        # scores = get_similarity_score(means, gmm_weights, q.reshape(-1, 32, 256))
+        scores = get_distance_score(means, gmm_weights, q.reshape(-1, 32, 256))
+        output = scores.cpu().tolist()
         results.extend(output)
 
         bar.suffix = '({batch}/{size}) | Total:{total:} | ETA:{eta:}'.format(
@@ -161,8 +185,39 @@ def get_scores(model, loader, means, gmm_weights, threshold):
             )
         bar.next()
     bar.finish()
-    print(sum(results) / len(results))
     return results
+
+
+def get_distance_score(mu, gmm_weights, x):
+    '''
+    Args:
+        x: features of input with shape (num_samples, kernels, dimensions)
+        mu: centers of gmm of all classes with shape (classes, kernels, dimensions)
+        det_sigma: Determinant of covariance matrix with shape (classes, kernels)
+        gmm_weights: weights of gmm with shape (classes, kernels)
+    '''
+    cls, kers, dims = mu.shape
+    num = x.shape[0]
+
+    for i in range(cls):
+        # expand mean
+        mu_ = mu[i:i+1].expand(num, kers, dims)
+
+        # reshape for calculation
+        x = x.reshape(-1, dims)
+        mu_ = mu_.reshape(-1, dims)
+
+        # calculate the euclidean distance
+        dist = F.pairwise_distance(x, mu_, p=2).reshape(num, kers)
+        dist = (dist * gmm_weights[i]).sum(-1)
+        if i == 0:
+            scores = dist.unsqueeze(1)
+        else:
+            scores = torch.cat([scores, dist.unsqueeze(1)], dim=1)
+    min_score, _ = scores.min(1)
+    # print(min_maha)
+
+    return min_score
 
 
 def get_similarity_score(mu, gmm_weights, x):

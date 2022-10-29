@@ -1,4 +1,4 @@
-OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=2 torchrun --nproc_per_node=1 --master_port 29499 ood_detector_maha.py \
+OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 --master_port 29501 ood_detector_maha.py \
 --arch resnet50 \
 --num_labels 100 \
 --threshold 1000 \
